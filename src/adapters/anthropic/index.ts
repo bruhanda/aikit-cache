@@ -2,6 +2,7 @@
 import { ConfigError } from '../../errors/config-error.js';
 import type { Cache, CacheRequest } from '../../core/types.js';
 import type { ChunkSerializer } from '../../types/stream.js';
+import { extractParams } from '../_shared/extract.js';
 import type { AnthropicLike, AnthropicStreamEvent } from './types.js';
 
 const WRAPPED = Symbol.for('aikit.cache.wrapped.anthropic');
@@ -24,19 +25,24 @@ export const anthropicStreamSerializer: ChunkSerializer<AnthropicStreamEvent> = 
 export interface WrapAnthropicOptions<TClient extends AnthropicLike = AnthropicLike> {
   readonly cache: Cache;
   readonly namespace?: string;
-  readonly skip?: <TReq extends Parameters<TClient['messages']['create']>[0]>(request: TReq) => boolean;
+  readonly skip?: (request: Parameters<TClient['messages']['create']>[0]) => boolean;
   readonly ttl?:
     | number
-    | (<TReq extends Parameters<TClient['messages']['create']>[0]>(request: TReq) => number);
+    | ((request: Parameters<TClient['messages']['create']>[0]) => number);
 }
 
 /**
- * Wrap an Anthropic SDK client. Intercepts `messages.create` (both stream
- * and non-stream) while preserving the SDK's exact return types.
+ * Wrap an Anthropic SDK client. Returns a `Proxy` with the **exact same
+ * type** as the input client; the original is **not** mutated, so two
+ * `wrapAnthropic` calls with different namespaces produce independent
+ * wrappers, and `instanceof Anthropic` keeps working on both.
+ *
+ * Intercepts `messages.create` (both stream and non-stream) and
+ * `messages.stream` while preserving the SDK's exact return types.
  *
  * @param client An Anthropic SDK client instance.
  * @param options Cache plus optional namespace / skip / ttl.
- * @returns The same client, methods replaced with cache-aware versions.
+ * @returns A typed Proxy preserving the SDK shape.
  */
 export function wrapAnthropic<TClient extends AnthropicLike>(
   client: TClient,
@@ -55,41 +61,36 @@ export function wrapAnthropic<TClient extends AnthropicLike>(
     if (typeof options.ttl === 'function') return options.ttl(request as never);
     return undefined;
   };
-  const shouldSkip = (request: unknown): boolean => (options.skip ? options.skip(request as never) : false);
+  const shouldSkip = (request: unknown): boolean =>
+    options.skip ? options.skip(request as never) : false;
 
-  const original = {
-    create: client.messages.create.bind(client.messages),
-    stream: client.messages.stream?.bind(client.messages),
-  };
-
-  const wrapCreate = (...args: unknown[]): unknown => {
-    const params = (args[0] ?? {}) as Record<string, unknown>;
-    if (shouldSkip(params)) return original.create(...args);
-    const isStream = params['stream'] === true;
-    const req = buildRequest(params, namespace);
-    const ttl = resolveTtl(params);
-    if (isStream) {
-      const wrapOpts: { serializer: ChunkSerializer<AnthropicStreamEvent>; ttl?: number } = {
-        serializer: anthropicStreamSerializer,
-      };
-      if (ttl !== undefined) wrapOpts.ttl = ttl;
-      return cache.wrapStream<AnthropicStreamEvent>(
-        req,
-        () => original.create(...args) as Promise<ReadableStream<AnthropicStreamEvent>>,
-        wrapOpts,
-      );
-    }
-    const wrapOpts: { ttl?: number } = {};
-    if (ttl !== undefined) wrapOpts.ttl = ttl;
-    return cache.wrap(req, () => original.create(...args), wrapOpts);
-  };
-
-  client.messages.create = wrapCreate as TClient['messages']['create'];
-
-  if (original.stream) {
-    const wrapStreamMethod = (...args: unknown[]): unknown => {
+  const wrapCreate = (original: (...args: any[]) => any) =>
+    function wrapped(this: unknown, ...args: unknown[]) {
       const params = (args[0] ?? {}) as Record<string, unknown>;
-      if (shouldSkip(params)) return original.stream!(...args);
+      if (shouldSkip(params)) return original.apply(this, args);
+      const isStream = params['stream'] === true;
+      const req = buildRequest(params, namespace);
+      const ttl = resolveTtl(params);
+      if (isStream) {
+        const wrapOpts: { serializer: ChunkSerializer<AnthropicStreamEvent>; ttl?: number } = {
+          serializer: anthropicStreamSerializer,
+        };
+        if (ttl !== undefined) wrapOpts.ttl = ttl;
+        return cache.wrapStream<AnthropicStreamEvent>(
+          req,
+          () => original.apply(this, args) as Promise<ReadableStream<AnthropicStreamEvent>>,
+          wrapOpts,
+        );
+      }
+      const wrapOpts: { ttl?: number } = {};
+      if (ttl !== undefined) wrapOpts.ttl = ttl;
+      return cache.wrap(req, () => original.apply(this, args), wrapOpts);
+    };
+
+  const wrapStreamMethod = (original: (...args: any[]) => any) =>
+    function wrapped(this: unknown, ...args: unknown[]) {
+      const params = (args[0] ?? {}) as Record<string, unknown>;
+      if (shouldSkip(params)) return original.apply(this, args);
       const req = buildRequest(params, namespace);
       const ttl = resolveTtl(params);
       const wrapOpts: { serializer: ChunkSerializer<AnthropicStreamEvent>; ttl?: number } = {
@@ -98,25 +99,39 @@ export function wrapAnthropic<TClient extends AnthropicLike>(
       if (ttl !== undefined) wrapOpts.ttl = ttl;
       return cache.wrapStream<AnthropicStreamEvent>(
         req,
-        () => original.stream!(...args) as Promise<ReadableStream<AnthropicStreamEvent>>,
+        () => original.apply(this, args) as Promise<ReadableStream<AnthropicStreamEvent>>,
         wrapOpts,
       );
     };
-    client.messages.stream = wrapStreamMethod as NonNullable<TClient['messages']['stream']>;
-  }
 
-  Object.defineProperty(client, WRAPPED, { value: true, enumerable: false });
-  return client;
+  const messagesProxy = new Proxy(client.messages, {
+    get(target, prop, receiver) {
+      if (prop === 'create') {
+        const original = Reflect.get(target, 'create', receiver) as (...args: any[]) => any;
+        return wrapCreate(original.bind(target));
+      }
+      if (prop === 'stream') {
+        const original = Reflect.get(target, 'stream', receiver) as ((...args: any[]) => any) | undefined;
+        if (!original) return undefined;
+        return wrapStreamMethod(original.bind(target));
+      }
+      return Reflect.get(target, prop, receiver);
+    },
+  });
+
+  return new Proxy(client, {
+    get(target, prop, receiver) {
+      if (prop === WRAPPED) return true;
+      if (prop === 'messages') return messagesProxy;
+      return Reflect.get(target, prop, receiver);
+    },
+  }) as TClient;
 }
 
 function buildRequest(params: Record<string, unknown>, namespace: string | undefined): CacheRequest {
   const model = typeof params['model'] === 'string' ? params['model'] : 'unknown';
   const messages = params['messages'];
-  const restParams: Record<string, unknown> = {};
-  for (const k of Object.keys(params)) {
-    if (k === 'model' || k === 'messages' || k === 'tools' || k === 'stream') continue;
-    restParams[k] = params[k];
-  }
+  const restParams = extractParams(params);
   const out: { -readonly [K in keyof CacheRequest]: CacheRequest[K] } = {
     model,
     params: restParams,

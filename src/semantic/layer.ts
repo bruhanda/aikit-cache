@@ -1,7 +1,5 @@
 import { ConfigError } from '../errors/config-error.js';
 import { EmbeddingError } from '../errors/embedding-error.js';
-import { computeCost } from '../cost/tracker.js';
-import { getPricing } from '../cost/pricing-registry.js';
 import type {
   Cache,
   CacheRequest,
@@ -42,13 +40,12 @@ export function withSemantic(options: SemanticOptions): SemanticLayer {
     });
   }
   const topK = options.topK ?? 5;
-  const onlyOnMiss = options.onlyOnMiss ?? true;
   const extractText = options.extractText ?? defaultExtractText;
   const rerank = options.rerank ?? defaultRerank;
 
   return {
-    _install(cache: Cache, storage: CacheStorage): SemanticLayerHandle {
-      void cache; // public surface; layer doesn't need a back-reference today
+    _install(getCache: () => Cache, storage: CacheStorage): SemanticLayerHandle {
+      void getCache; // captured lazily; layer doesn't need a back-reference today
       const vectorStore = new VectorStoreAdapter(storage);
       let embeddingCostUSD = 0;
 
@@ -82,9 +79,8 @@ export function withSemantic(options: SemanticOptions): SemanticLayer {
           );
         }
 
-        const pricing = getPricing(options.embeddings.model);
-        if (pricing) {
-          embeddingCostUSD += computeCost(pricing, {
+        if (options.costTracker) {
+          embeddingCostUSD += options.costTracker.estimateUSD(options.embeddings.model, {
             inputTokens: estimateTokens(text),
             outputTokens: 0,
           });
@@ -96,7 +92,11 @@ export function withSemantic(options: SemanticOptions): SemanticLayer {
       const handle: SemanticLayerHandle = {
         enabled: true,
         async lookup(request, _canonicalText): Promise<{ readonly hit: false } | { readonly hit: true; readonly value: unknown; readonly key: string; readonly similarity: number }> {
-          if (!onlyOnMiss) return { hit: false };
+          // `lookup` is only invoked from `wrap()` after an exact miss, so the
+          // post-miss path matches `onlyOnMiss: true` (the documented default).
+          // `onlyOnMiss: false` would also call lookup *before* the exact check —
+          // tracked as future work; the option is retained on `SemanticOptions`
+          // so callers can opt in once the pre-miss path lands.
           const vector = await embed(request);
           if (!vector) return { hit: false };
           const ns = options.vectorNamespace;

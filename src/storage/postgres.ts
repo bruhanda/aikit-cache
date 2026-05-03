@@ -30,6 +30,11 @@ export interface PostgresStorageOptions {
   /** Optional pgvector configuration. When set, `capabilities.vectorSearch === true`. */
   readonly vectorColumn?: { readonly name: string; readonly dimensions: number };
   readonly transformAtRest?: TransformAtRest;
+  /**
+   * Optional clock for deterministic expiry checks. Defaults to `Date.now`.
+   * Pass the same clock as `createCache({ clock })` from tests.
+   */
+  readonly clock?: { now(): number };
 }
 
 interface CacheRow {
@@ -53,6 +58,7 @@ export function postgresStorage(options: PostgresStorageOptions): CacheStorage {
   const table = options.tableName ?? 'aikit_cache';
   const transform = options.transformAtRest;
   const vectorCol = options.vectorColumn;
+  const now = options.clock?.now.bind(options.clock) ?? (() => Date.now());
 
   const capabilities: StorageCapabilities = Object.freeze({
     prefixScan: true,
@@ -109,7 +115,7 @@ export function postgresStorage(options: PostgresStorageOptions): CacheStorage {
         const row = rows[0];
         if (!row) return undefined;
         const exp = typeof row.exp === 'string' ? Number.parseInt(row.exp, 10) : row.exp;
-        if (exp <= Date.now()) {
+        if (exp <= now()) {
           await client.query(`DELETE FROM ${table} WHERE key = $1`, [key]);
           return undefined;
         }
@@ -228,7 +234,7 @@ export function postgresStorage(options: PostgresStorageOptions): CacheStorage {
          WHERE ${vectorCol.name} IS NOT NULL AND exp > $2
          ORDER BY ${vectorCol.name} <=> $1::vector ASC
          LIMIT $3`,
-        [vector, Date.now(), topK],
+        [vector, now(), topK],
       );
       const rows = 'rows' in result && result.rows ? result.rows : [];
       return rows.map<VectorSearchHit>((row) => ({

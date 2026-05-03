@@ -2,6 +2,7 @@
 import { ConfigError } from '../../errors/config-error.js';
 import type { Cache, CacheRequest } from '../../core/types.js';
 import type { ChunkSerializer } from '../../types/stream.js';
+import { extractParams } from '../_shared/extract.js';
 import type { OpenAILike, OpenAIStreamChunk } from './types.js';
 
 const WRAPPED = Symbol.for('aikit.cache.wrapped.openai');
@@ -23,26 +24,29 @@ export const openAIStreamSerializer: ChunkSerializer<OpenAIStreamChunk> = {
   },
 };
 
+/**
+ * Options for {@link wrapOpenAI}. The `TClient` generic flows through
+ * `skip`/`ttl` so callbacks autocomplete against the user's installed
+ * `openai` SDK version.
+ */
 export interface WrapClientOptions<TClient extends OpenAILike = OpenAILike> {
   readonly cache: Cache;
   /** Sub-namespace mixed into the cache key in addition to the cache's global namespace. */
   readonly namespace?: string;
-  /**
-   * Skip caching for requests where this returns true. Generic in `TClient`
-   * so callbacks autocomplete against the SDK's `ChatCompletionCreateParams`.
-   */
-  readonly skip?: <TReq extends Parameters<TClient['chat']['completions']['create']>[0]>(
-    request: TReq,
-  ) => boolean;
+  /** Skip caching for requests where this returns true. */
+  readonly skip?: (request: Parameters<TClient['chat']['completions']['create']>[0]) => boolean;
   /** TTL override per request; either a number or a callback. */
   readonly ttl?:
     | number
-    | (<TReq extends Parameters<TClient['chat']['completions']['create']>[0]>(request: TReq) => number);
+    | ((request: Parameters<TClient['chat']['completions']['create']>[0]) => number);
 }
 
 /**
  * Wrap an OpenAI client with caching. Returns a `Proxy` with the **exact
- * same type** as the input client, preserving all SDK return types verbatim.
+ * same type** as the input client, preserving all SDK return types verbatim
+ * and keeping `instanceof OpenAI` working. The original client is **not**
+ * mutated — calling `wrapOpenAI(client, ...)` twice with different
+ * namespaces yields two independent wrappers over the same client.
  *
  * Intercepted methods:
  *   - `chat.completions.create({ stream: false })` → exact-match cache.
@@ -66,8 +70,7 @@ export function wrapOpenAI<TClient extends OpenAILike>(
   if (!options?.cache) {
     throw new ConfigError('CACHE_INVALID_OPTIONS', 'wrapOpenAI requires a `cache` option', { field: 'cache' });
   }
-  const existing = (client as unknown as Record<symbol, boolean>)[WRAPPED];
-  if (existing) return client;
+  if ((client as unknown as Record<symbol, boolean>)[WRAPPED]) return client;
 
   const cache = options.cache;
   const namespace = options.namespace;
@@ -77,17 +80,17 @@ export function wrapOpenAI<TClient extends OpenAILike>(
     if (typeof options.ttl === 'function') return options.ttl(request as never);
     return undefined;
   };
-  const shouldSkip = (request: unknown): boolean => {
-    if (!options.skip) return false;
-    return options.skip(request as never);
-  };
+  const shouldSkip = (request: unknown): boolean =>
+    options.skip ? options.skip(request as never) : false;
 
-  const wrapChat = (originalCreate: (...args: any[]) => any): ((...args: any[]) => any) =>
-    function wrappedCreate(this: unknown, params: Record<string, unknown>, ...rest: unknown[]) {
+  const wrapChatCreate = (
+    original: (...args: any[]) => any,
+  ): ((this: unknown, params: Record<string, unknown>, ...rest: unknown[]) => unknown) =>
+    function wrapped(this: unknown, params: Record<string, unknown>, ...rest: unknown[]) {
       const isStream = params['stream'] === true;
-      if (shouldSkip(params)) return originalCreate.call(this, params, ...rest);
+      if (shouldSkip(params)) return original.call(this, params, ...rest);
 
-      const req: CacheRequest = buildRequest(params, namespace, options.namespace);
+      const req: CacheRequest = buildRequest(params, namespace);
       const ttl = resolveTtl(params);
       if (isStream) {
         const wrapOpts: { serializer: ChunkSerializer<OpenAIStreamChunk>; ttl?: number } = {
@@ -96,18 +99,20 @@ export function wrapOpenAI<TClient extends OpenAILike>(
         if (ttl !== undefined) wrapOpts.ttl = ttl;
         return cache.wrapStream<OpenAIStreamChunk>(
           req,
-          () => originalCreate.call(this, params, ...rest) as Promise<ReadableStream<OpenAIStreamChunk>>,
+          () => original.call(this, params, ...rest) as Promise<ReadableStream<OpenAIStreamChunk>>,
           wrapOpts,
         );
       }
       const wrapOpts: { ttl?: number } = {};
       if (ttl !== undefined) wrapOpts.ttl = ttl;
-      return cache.wrap(req, () => originalCreate.call(this, params, ...rest), wrapOpts);
+      return cache.wrap(req, () => original.call(this, params, ...rest), wrapOpts);
     };
 
-  const wrapEmbeddings = (originalCreate: (...args: any[]) => any): ((...args: any[]) => any) =>
-    function wrappedCreate(this: unknown, params: Record<string, unknown>, ...rest: unknown[]) {
-      if (shouldSkip(params)) return originalCreate.call(this, params, ...rest);
+  const wrapEmbeddingsCreate = (
+    original: (...args: any[]) => any,
+  ): ((this: unknown, params: Record<string, unknown>, ...rest: unknown[]) => unknown) =>
+    function wrapped(this: unknown, params: Record<string, unknown>, ...rest: unknown[]) {
+      if (shouldSkip(params)) return original.call(this, params, ...rest);
       const req: CacheRequest = {
         model: typeof params['model'] === 'string' ? params['model'] : 'unknown',
         input: params['input'],
@@ -116,12 +121,14 @@ export function wrapOpenAI<TClient extends OpenAILike>(
       const ttl = resolveTtl(params);
       const wrapOpts: { ttl?: number } = {};
       if (ttl !== undefined) wrapOpts.ttl = ttl;
-      return cache.wrap(req, () => originalCreate.call(this, params, ...rest), wrapOpts);
+      return cache.wrap(req, () => original.call(this, params, ...rest), wrapOpts);
     };
 
-  const wrapResponses = (originalCreate: (...args: any[]) => any): ((...args: any[]) => any) =>
-    function wrappedCreate(this: unknown, params: Record<string, unknown>, ...rest: unknown[]) {
-      if (shouldSkip(params)) return originalCreate.call(this, params, ...rest);
+  const wrapResponsesCreate = (
+    original: (...args: any[]) => any,
+  ): ((this: unknown, params: Record<string, unknown>, ...rest: unknown[]) => unknown) =>
+    function wrapped(this: unknown, params: Record<string, unknown>, ...rest: unknown[]) {
+      if (shouldSkip(params)) return original.call(this, params, ...rest);
       const isStream = params['stream'] === true;
       const req: CacheRequest = {
         model: typeof params['model'] === 'string' ? params['model'] : 'unknown',
@@ -136,47 +143,76 @@ export function wrapOpenAI<TClient extends OpenAILike>(
         if (ttl !== undefined) wrapOpts.ttl = ttl;
         return cache.wrapStream<OpenAIStreamChunk>(
           req,
-          () => originalCreate.call(this, params, ...rest) as Promise<ReadableStream<OpenAIStreamChunk>>,
+          () => original.call(this, params, ...rest) as Promise<ReadableStream<OpenAIStreamChunk>>,
           wrapOpts,
         );
       }
       const wrapOpts: { ttl?: number } = {};
       if (ttl !== undefined) wrapOpts.ttl = ttl;
-      return cache.wrap(req, () => originalCreate.call(this, params, ...rest), wrapOpts);
+      return cache.wrap(req, () => original.call(this, params, ...rest), wrapOpts);
     };
 
-  const original = {
-    chatCreate: client.chat.completions.create.bind(client.chat.completions),
-    embeddingsCreate: client.embeddings?.create?.bind(client.embeddings),
-    responsesCreate: client.responses?.create?.bind(client.responses),
-  };
+  const completionsProxy = (completions: { create: (...args: any[]) => any }) =>
+    new Proxy(completions, {
+      get(target, prop, receiver) {
+        if (prop === 'create') {
+          const original = Reflect.get(target, 'create', receiver) as (...args: any[]) => any;
+          return wrapChatCreate(original.bind(target));
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    });
 
-  client.chat.completions.create = wrapChat(original.chatCreate) as TClient['chat']['completions']['create'];
-  if (client.embeddings && original.embeddingsCreate) {
-    client.embeddings.create = wrapEmbeddings(original.embeddingsCreate) as NonNullable<TClient['embeddings']>['create'];
-  }
-  if (client.responses && original.responsesCreate) {
-    client.responses.create = wrapResponses(original.responsesCreate) as NonNullable<TClient['responses']>['create'];
-  }
-  Object.defineProperty(client, WRAPPED, { value: true, enumerable: false });
-  return client;
+  const chatProxy = new Proxy(client.chat, {
+    get(target, prop, receiver) {
+      if (prop === 'completions') {
+        return completionsProxy(Reflect.get(target, 'completions', receiver));
+      }
+      return Reflect.get(target, prop, receiver);
+    },
+  });
+
+  const embeddingsProxy = client.embeddings
+    ? new Proxy(client.embeddings, {
+        get(target, prop, receiver) {
+          if (prop === 'create') {
+            const original = Reflect.get(target, 'create', receiver) as (...args: any[]) => any;
+            return wrapEmbeddingsCreate(original.bind(target));
+          }
+          return Reflect.get(target, prop, receiver);
+        },
+      })
+    : undefined;
+
+  const responsesProxy = client.responses
+    ? new Proxy(client.responses, {
+        get(target, prop, receiver) {
+          if (prop === 'create') {
+            const original = Reflect.get(target, 'create', receiver) as (...args: any[]) => any;
+            return wrapResponsesCreate(original.bind(target));
+          }
+          return Reflect.get(target, prop, receiver);
+        },
+      })
+    : undefined;
+
+  return new Proxy(client, {
+    get(target, prop, receiver) {
+      if (prop === WRAPPED) return true;
+      if (prop === 'chat') return chatProxy;
+      if (prop === 'embeddings' && embeddingsProxy) return embeddingsProxy;
+      if (prop === 'responses' && responsesProxy) return responsesProxy;
+      return Reflect.get(target, prop, receiver);
+    },
+  }) as TClient;
 }
 
-function buildRequest(
-  params: Record<string, unknown>,
-  namespace: string | undefined,
-  _localNamespace: string | undefined,
-): CacheRequest {
+function buildRequest(params: Record<string, unknown>, namespace: string | undefined): CacheRequest {
   const model = typeof params['model'] === 'string' ? params['model'] : 'unknown';
   const messages = params['messages'];
-  const restParams: Record<string, unknown> = {};
-  for (const k of Object.keys(params)) {
-    if (k === 'model' || k === 'messages' || k === 'tools' || k === 'stream' || k === 'stream_options') continue;
-    restParams[k] = params[k];
-  }
   const out: { -readonly [K in keyof CacheRequest]: CacheRequest[K] } = {
     model,
-    params: restParams,
+    params: extractParams(params),
   };
   if (Array.isArray(messages)) out.messages = messages as NonNullable<CacheRequest['messages']>;
   if (Array.isArray(params['tools'])) out.tools = params['tools'] as NonNullable<CacheRequest['tools']>;

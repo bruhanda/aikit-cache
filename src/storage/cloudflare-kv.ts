@@ -66,6 +66,7 @@ export function cloudflareKVStorage(
   const prefix = options.keyPrefix ?? 'aikit:';
   const transform = options.transformAtRest;
   const enforceMin = options.enforceMinimumTtl !== false;
+  let warnedMinTtl = false;
 
   const capabilities: StorageCapabilities = Object.freeze({
     prefixScan: true,
@@ -115,7 +116,19 @@ export function cloudflareKVStorage(
       try {
         const value = await encode(entry);
         const ttlSeconds = Math.ceil(Math.max(1, ttlMs) / 1000);
-        const expirationTtl = enforceMin ? Math.max(60, ttlSeconds) : ttlSeconds;
+        let expirationTtl = ttlSeconds;
+        if (enforceMin && ttlSeconds < 60) {
+          if (!warnedMinTtl) {
+            warnedMinTtl = true;
+            // Cloudflare KV rejects TTLs under 60 seconds. We round up
+            // silently from then on, but warn once so users debugging
+            // "why is my 5s TTL acting like 60s" find the answer fast.
+            (globalThis as { console?: Console }).console?.warn?.(
+              `[aikit-cache] Cloudflare KV requires expirationTtl >= 60s; rounding ${ttlSeconds}s up to 60s. Set enforceMinimumTtl: false to opt out.`,
+            );
+          }
+          expirationTtl = 60;
+        }
         const tags = entry.tags;
         const putOpts =
           tags && tags.length > 0

@@ -1,4 +1,5 @@
 import { StreamError } from '../errors/stream-error.js';
+import { fromBase64Url, toBase64Url } from '../internal/encoding.js';
 import type { ChunkSerializer } from '../types/stream.js';
 
 /**
@@ -136,7 +137,7 @@ export function serializeStreamEnvelope<TChunk>(
     });
   }
   const data: StreamEnvelope['data'] =
-    typeof serialized === 'string' ? serialized : { $bytes: bytesToBase64Url(serialized) };
+    typeof serialized === 'string' ? serialized : { $bytes: toBase64Url(serialized) };
   return timings ? { serializerId: serializer.id, data, timings } : { serializerId: serializer.id, data };
 }
 
@@ -162,7 +163,7 @@ export function deserializeStreamEnvelope<TChunk>(
     );
   }
   const data: string | Uint8Array =
-    typeof envelope.data === 'string' ? envelope.data : base64UrlToBytes(envelope.data.$bytes);
+    typeof envelope.data === 'string' ? envelope.data : fromBase64Url(envelope.data.$bytes);
   let chunks: readonly TChunk[];
   try {
     chunks = serializer.deserialize(data);
@@ -175,20 +176,3 @@ export function deserializeStreamEnvelope<TChunk>(
   return envelope.timings ? { chunks, timings: envelope.timings } : { chunks };
 }
 
-function bytesToBase64Url(bytes: Uint8Array): string {
-  let binary = '';
-  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]!);
-  const g = globalThis as { btoa?: (s: string) => string; Buffer?: { from(s: string, e: string): { toString(e: string): string } } };
-  const b64 = g.btoa ? g.btoa(binary) : g.Buffer!.from(binary, 'binary').toString('base64');
-  return b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-}
-
-function base64UrlToBytes(s: string): Uint8Array {
-  const padded = s.replace(/-/g, '+').replace(/_/g, '/');
-  const padding = padded.length % 4 === 0 ? '' : '='.repeat(4 - (padded.length % 4));
-  const g = globalThis as { atob?: (s: string) => string; Buffer?: { from(s: string, e: string): { toString(e: string): string } } };
-  const binary = g.atob ? g.atob(padded + padding) : g.Buffer!.from(padded + padding, 'base64').toString('binary');
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  return bytes;
-}

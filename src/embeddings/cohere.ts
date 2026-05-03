@@ -1,4 +1,5 @@
 import { EmbeddingError } from '../errors/embedding-error.js';
+import { normalizeVector } from '../internal/vector.js';
 import type { EmbeddingProvider } from './types.js';
 
 const DEFAULT_MODEL = 'embed-v4.0';
@@ -68,17 +69,7 @@ export function cohereEmbeddings(options: {
           `cohere returned ${arr?.length ?? 0} embeddings, expected ${inputs.length}`,
         );
       }
-      return arr.map((row) => normalize(Float32Array.from(row)));
+      return arr.map((row) => normalizeVector(Float32Array.from(row)));
     },
   };
-}
-
-function normalize(v: Float32Array): Float32Array {
-  let sum = 0;
-  for (let i = 0; i < v.length; i++) sum += v[i]! * v[i]!;
-  const norm = Math.sqrt(sum);
-  if (norm === 0) return v;
-  const out = new Float32Array(v.length);
-  for (let i = 0; i < v.length; i++) out[i] = v[i]! / norm;
-  return out;
 }

@@ -25,6 +25,7 @@ export type {
   CacheStatsSnapshot,
   CacheStorage,
   CostSavings,
+  CostTracker,
   DistributedLock,
   InvalidationPattern,
   ModelPricing,

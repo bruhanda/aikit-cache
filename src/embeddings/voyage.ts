@@ -1,4 +1,5 @@
 import { EmbeddingError } from '../errors/embedding-error.js';
+import { normalizeVector } from '../internal/vector.js';
 import type { EmbeddingProvider } from './types.js';
 
 const DEFAULT_MODEL = 'voyage-3';
@@ -55,17 +56,7 @@ export function voyageEmbeddings(options: {
           `voyage returned ${json.data?.length ?? 0} embeddings, expected ${inputs.length}`,
         );
       }
-      return json.data.map((row) => normalize(Float32Array.from(row.embedding)));
+      return json.data.map((row) => normalizeVector(Float32Array.from(row.embedding)));
     },
   };
-}
-
-function normalize(v: Float32Array): Float32Array {
-  let sum = 0;
-  for (let i = 0; i < v.length; i++) sum += v[i]! * v[i]!;
-  const norm = Math.sqrt(sum);
-  if (norm === 0) return v;
-  const out = new Float32Array(v.length);
-  for (let i = 0; i < v.length; i++) out[i] = v[i]! / norm;
-  return out;
 }

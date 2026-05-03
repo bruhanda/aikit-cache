@@ -1,6 +1,6 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
 import { ConfigError } from '../../errors/config-error.js';
 import type { Cache, CacheRequest } from '../../core/types.js';
+import { extractCacheRequestFromBody } from '../_shared/extract.js';
 
 /** Subset of `express.Request`. */
 export interface ExpressRequestLike {
@@ -15,14 +15,16 @@ export interface ExpressResponseLike {
   send(body: unknown): unknown;
   status(code: number): ExpressResponseLike;
   setHeader?(name: string, value: string): unknown;
+  statusCode?: number;
 }
 
 export type ExpressNext = (err?: unknown) => void;
 
 /**
  * Express request-handler middleware. On cache hit, responds with the
- * cached JSON without calling `next()`. On miss, calls `next()` and
- * leaves the downstream handler responsible for sending the response.
+ * cached JSON without calling `next()`. On miss, intercepts the
+ * downstream handler's `res.json` / `res.send` so the JSON body is
+ * captured and persisted before being forwarded to the client.
  *
  * @param options Cache plus optional TTL and request extractor.
  * @returns Express-compatible request handler.
@@ -57,6 +59,34 @@ export function cacheMiddleware(options: {
           return;
         }
         res.setHeader?.('X-Cache', 'MISS');
+
+        const setOpts: { ttl?: number } = {};
+        if (options.ttl !== undefined) setOpts.ttl = options.ttl;
+        const persist = (body: unknown): void => {
+          const status = res.statusCode ?? 200;
+          if (status < 200 || status >= 300) return;
+          void cache.set(cacheReq!, body, setOpts).catch(() => {});
+        };
+
+        const originalJson = res.json.bind(res);
+        const originalSend = res.send.bind(res);
+        res.json = (body: unknown) => {
+          persist(body);
+          return originalJson(body);
+        };
+        res.send = (body: unknown) => {
+          if (typeof body === 'string') {
+            try {
+              persist(JSON.parse(body));
+            } catch {
+              // non-JSON body — skip
+            }
+          } else if (body !== undefined) {
+            persist(body);
+          }
+          return originalSend(body);
+        };
+
         next();
       })
       .catch(() => next());
@@ -64,25 +94,5 @@ export function cacheMiddleware(options: {
 }
 
 function defaultExtract(req: ExpressRequestLike): CacheRequest | undefined {
-  const body = req.body;
-  if (!body || typeof body !== 'object') return undefined;
-  const b = body as Record<string, unknown>;
-  if (typeof b['model'] !== 'string') return undefined;
-  const out: { -readonly [K in keyof CacheRequest]: CacheRequest[K] } = {
-    model: b['model'],
-    params: extractParams(b),
-  };
-  if (Array.isArray(b['messages'])) out.messages = b['messages'] as NonNullable<CacheRequest['messages']>;
-  else out.input = b;
-  if (Array.isArray(b['tools'])) out.tools = b['tools'] as NonNullable<CacheRequest['tools']>;
-  return out;
-}
-
-function extractParams(body: Record<string, unknown>): Record<string, unknown> {
-  const params: Record<string, unknown> = {};
-  for (const k of Object.keys(body)) {
-    if (k === 'model' || k === 'messages' || k === 'tools' || k === 'stream' || k === 'stream_options') continue;
-    params[k] = body[k];
-  }
-  return params;
+  return extractCacheRequestFromBody(req.body);
 }

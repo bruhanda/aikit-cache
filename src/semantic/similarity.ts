@@ -1,3 +1,5 @@
+import { normalizeVector } from '../internal/vector.js';
+
 /**
  * Cosine similarity over **already-normalized** unit vectors. Equal to a
  * dot product because both magnitudes are 1. Throws when the dimensions
@@ -18,21 +20,14 @@ export function cosineSimilarity(a: Float32Array, b: Float32Array): number {
 }
 
 /**
- * Normalize a vector to unit length. Returns the original vector when its
- * magnitude is `0` (avoids division-by-zero — caller's data was empty).
+ * Normalize a vector to unit length. Re-exported from the internal helper
+ * so embedding adapters and the semantic surface share a single
+ * implementation.
  *
  * @param v Source vector.
  * @returns A new `Float32Array` of length `v.length`.
  */
-export function normalize(v: Float32Array): Float32Array {
-  let sum = 0;
-  for (let i = 0; i < v.length; i++) sum += v[i]! * v[i]!;
-  const norm = Math.sqrt(sum);
-  if (norm === 0) return v;
-  const out = new Float32Array(v.length);
-  for (let i = 0; i < v.length; i++) out[i] = v[i]! / norm;
-  return out;
-}
+export const normalize = normalizeVector;
 
 /**
  * Top-K selection by score. Returns indices in descending-score order.

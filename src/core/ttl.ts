@@ -55,11 +55,17 @@ export function resolveTTL(args: {
  *
  * @param ttlMs Base TTL.
  * @param jitter Fractional jitter in `[0, 1]`. Default is `DEFAULT_TTL_JITTER`.
+ * @param rng Pluggable random source in `[0, 1)`. Defaults to `Math.random`;
+ *   inject a deterministic generator from tests.
  * @returns Jittered TTL, never less than 1 ms.
  */
-export function applyJitter(ttlMs: number, jitter: number = DEFAULT_TTL_JITTER): number {
+export function applyJitter(
+  ttlMs: number,
+  jitter: number = DEFAULT_TTL_JITTER,
+  rng: () => number = Math.random,
+): number {
   if (jitter <= 0) return ttlMs;
-  const delta = ttlMs * jitter * (Math.random() * 2 - 1);
+  const delta = ttlMs * jitter * (rng() * 2 - 1);
   return Math.max(1, Math.round(ttlMs + delta));
 }
 

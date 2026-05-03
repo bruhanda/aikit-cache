@@ -32,6 +32,11 @@ export interface SqliteStorageOptions {
   /** Table name. Default `'aikit_cache'`. */
   readonly tableName?: string;
   readonly transformAtRest?: TransformAtRest;
+  /**
+   * Optional clock for deterministic expiry checks. Defaults to `Date.now`.
+   * Pass the same clock as `createCache({ clock })` from tests.
+   */
+  readonly clock?: { now(): number };
 }
 
 interface CacheRow {
@@ -64,6 +69,7 @@ export function sqliteStorage(options: SqliteStorageOptions): CacheStorage {
   const db = options.database;
   const table = options.tableName ?? 'aikit_cache';
   const transform = options.transformAtRest;
+  const now = options.clock?.now.bind(options.clock) ?? (() => Date.now());
 
   db.exec(
     `CREATE TABLE IF NOT EXISTS ${table} (
@@ -114,7 +120,7 @@ export function sqliteStorage(options: SqliteStorageOptions): CacheStorage {
       try {
         const row = stmtGet.get(key);
         if (!row) return undefined;
-        if (row.exp <= Date.now()) {
+        if (row.exp <= now()) {
           stmtDelete.run(key);
           return undefined;
         }

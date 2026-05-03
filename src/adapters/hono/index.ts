@@ -1,6 +1,6 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
 import { ConfigError } from '../../errors/config-error.js';
 import type { Cache, CacheRequest } from '../../core/types.js';
+import { extractCacheRequestFromBody } from '../_shared/extract.js';
 
 /**
  * Minimal structural view of Hono's `Context`. We do not import `hono`.
@@ -15,6 +15,7 @@ export interface HonoContextLike {
     json(): Promise<unknown>;
     raw?: Request;
   };
+  res: Response;
   json(value: unknown, status?: number): Response;
 }
 
@@ -24,7 +25,7 @@ export type HonoNext = () => Promise<void>;
  * Hono middleware that intercepts `/v1/chat/completions`-style POST routes
  * proxied to a backend. On cache hit, returns the cached response with no
  * downstream call. On miss, runs the next handler and stores the JSON body
- * of the resulting `Response`.
+ * of the resulting `Response` (read off `c.res` after `next()`).
  *
  * @param options Cache plus optional TTL and request extractor.
  * @returns Hono-compatible middleware function.
@@ -54,40 +55,29 @@ export function cacheMiddleware(options: {
     if (!req) return next();
 
     const cached = await cache.get<unknown>(req);
-    if (cached !== undefined) return c.json(cached);
+    if (cached !== undefined) {
+      const res = c.json(cached);
+      res.headers.set('X-Cache', 'HIT');
+      return res;
+    }
 
     await next();
-    const setOpts: { ttl?: number } = {};
-    if (options.ttl !== undefined) setOpts.ttl = options.ttl;
-    // Hono does not surface the response body to the middleware after `next()`.
-    // We rely on consumers re-invoking via the `extractRequest` lookup path
-    // and writing entries explicitly when the handler completes. For a
-    // fully-automatic cache-the-response flow, see `adapters/next` which
-    // runs at the handler level.
-    void setOpts;
+
+    const downstream = c.res;
+    if (!downstream || !downstream.ok) return undefined;
+    try {
+      const body = (await downstream.clone().json()) as unknown;
+      const setOpts: { ttl?: number } = {};
+      if (options.ttl !== undefined) setOpts.ttl = options.ttl;
+      await cache.set(req, body, setOpts);
+    } catch {
+      // non-JSON or already-consumed body — skip the write
+    }
     return undefined;
   };
 }
 
 async function defaultExtract(c: HonoContextLike): Promise<CacheRequest | undefined> {
   const body = (await c.req.json().catch(() => undefined)) as Record<string, unknown> | undefined;
-  if (!body || typeof body['model'] !== 'string') return undefined;
-  const model = body['model'];
-  const out: { -readonly [K in keyof CacheRequest]: CacheRequest[K] } = {
-    model,
-    params: extractParams(body),
-  };
-  if (Array.isArray(body['messages'])) out.messages = body['messages'] as NonNullable<CacheRequest['messages']>;
-  else out.input = body;
-  if (Array.isArray(body['tools'])) out.tools = body['tools'] as NonNullable<CacheRequest['tools']>;
-  return out;
-}
-
-function extractParams(body: Record<string, unknown>): Record<string, unknown> {
-  const params: Record<string, unknown> = {};
-  for (const k of Object.keys(body)) {
-    if (k === 'model' || k === 'messages' || k === 'tools' || k === 'stream' || k === 'stream_options') continue;
-    params[k] = body[k];
-  }
-  return params;
+  return extractCacheRequestFromBody(body);
 }

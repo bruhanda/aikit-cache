@@ -28,12 +28,17 @@ export class Coalescer<V = unknown> {
       return existing.promise;
     }
 
-    const promise = (async () => fn())();
+    const promise = Promise.resolve().then(fn);
     const entry = { promise, waiters: 0 };
     this.inflight.set(key, entry);
-    promise.finally(() => {
-      if (this.inflight.get(key) === entry) this.inflight.delete(key);
-    });
+    // .finally() returns a chained promise that mirrors rejection. Discarding
+    // it would surface as an UnhandledPromiseRejection on Node ≥15 because
+    // every waiter awaits `promise` directly, never the chained handle.
+    promise
+      .finally(() => {
+        if (this.inflight.get(key) === entry) this.inflight.delete(key);
+      })
+      .catch(() => {});
     return promise;
   }
 

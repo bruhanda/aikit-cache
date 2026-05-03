@@ -1,4 +1,9 @@
-import type { CacheEntryView, CacheRequest, SemanticLayer as SemanticLayerType } from '../core/types.js';
+import type {
+  CacheEntryView,
+  CacheRequest,
+  CostTracker,
+  SemanticLayer as SemanticLayerType,
+} from '../core/types.js';
 import type { EmbeddingProvider } from '../embeddings/types.js';
 
 export type { EmbeddingProvider } from '../embeddings/types.js';
@@ -32,4 +37,11 @@ export interface SemanticOptions {
   readonly extractText?: (request: CacheRequest) => string;
   readonly vectorNamespace?: string;
   readonly rerank?: (candidates: readonly SemanticCandidate[]) => SemanticCandidate | undefined;
+  /**
+   * Optional cost tracker used to attribute embedding spend. Pass
+   * `defaultCostTracker` from `@aikit/cache/cost` to enable, or omit to
+   * keep `embeddingCostUSD` at `0`. Decoupled from the layer itself so
+   * `semantic/*` does not need to import `cost/*`.
+   */
+  readonly costTracker?: CostTracker;
 }

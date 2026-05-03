@@ -2,8 +2,6 @@ import { ConfigError } from '../errors/config-error.js';
 import { CacheError } from '../errors/base.js';
 import { StorageError } from '../errors/storage-error.js';
 import { StreamError } from '../errors/stream-error.js';
-import { computeCost } from '../cost/tracker.js';
-import { getPricing } from '../cost/pricing-registry.js';
 import { defaultClock, type Clock } from '../internal/clock.js';
 import { err, ok, type Result } from '../types/result.js';
 import { Coalescer, noopDistributedLock } from './coalesce.js';
@@ -90,14 +88,25 @@ export function createCache(options: CacheOptions): Cache {
   const stats = new StatsAccumulator(clock.now());
   const onError: 'silent' | 'throw' = options.onError ?? 'silent';
   const ttlJitter = options.ttlJitter ?? DEFAULT_TTL_JITTER;
-  const costTracking = options.costTracking ?? true;
+  const rng = options.rng ?? Math.random;
+  const costTracker = options.costTracker;
   const coalesceConfig = normalizeCoalesce(options.coalesce);
   const lock: DistributedLock = coalesceConfig.lock ?? noopDistributedLock;
   const ttlPolicy = options.ttl ?? { default: DEFAULT_TTL_MS };
   const namespace = options.namespace;
   const keyPolicy = options.keyPolicy;
   const storage = options.storage;
-  const semantic: SemanticLayerHandle | undefined = options.semantic?._install(undefined as unknown as Cache, storage);
+  let cacheRef: Cache | undefined;
+  const getCache = (): Cache => {
+    if (!cacheRef) {
+      throw new ConfigError(
+        'CACHE_INVALID_OPTIONS',
+        'semantic layer accessed Cache before construction completed',
+      );
+    }
+    return cacheRef;
+  };
+  const semantic: SemanticLayerHandle | undefined = options.semantic?._install(getCache, storage);
   const pendingWrites = new Set<Promise<unknown>>();
 
   let disposed = false;
@@ -122,6 +131,12 @@ export function createCache(options: CacheOptions): Cache {
         );
       }
       return ns;
+    }
+    if (request.namespace !== undefined && request.namespace.length === 0) {
+      throw new ConfigError(
+        'CONFIG_INVALID_NAMESPACE',
+        '`request.namespace` must be a non-empty string; refusing to silently fall back to the global keyspace',
+      );
     }
     return request.namespace ?? namespace;
   };
@@ -189,9 +204,8 @@ export function createCache(options: CacheOptions): Cache {
     similarity?: number,
   ): void => {
     let savedUSD = 0;
-    if (costTracking && entry.usage) {
-      const pricing = getPricing(request.model);
-      if (pricing) savedUSD = computeCost(pricing, entry.usage);
+    if (costTracker && entry.usage) {
+      savedUSD = costTracker.estimateUSD(request.model, entry.usage);
     }
     stats.recordHit(request.model, entry.usage, savedUSD);
     const view = {
@@ -255,7 +269,7 @@ export function createCache(options: CacheOptions): Cache {
         const value = await fn();
         if (!opts?.skipWrite) {
           const ttlBase = computeTTL(request, opts?.ttl);
-          const ttl = applyJitter(ttlBase, ttlJitter);
+          const ttl = applyJitter(ttlBase, ttlJitter, rng);
           const usage = opts?.usage ?? extractUsage(value);
           const extras: { tags?: readonly string[]; usage?: TokenUsage } = {};
           if (opts?.tags) extras.tags = opts.tags;
@@ -278,25 +292,28 @@ export function createCache(options: CacheOptions): Cache {
         return value;
       };
 
-      const lockHandle = await lock.acquire(key, { ttlMs: 30_000 });
-      try {
-        return await coalescer.dedupe(key, async () => {
-          const waiters = coalescer.waiters(key);
-          if (waiters > 0) {
-            stats.recordCoalesce(waiters);
-            events.emit('coalesce', { key, waiters });
-          }
-          if (lockHandle.held) return exec();
+      // Local coalescer first so 50 in-process callers map to one leader.
+      // Only that leader contends for the cross-process lock — without this
+      // ordering a hot key would burn N Redis round-trips per pod.
+      return (await coalescer.dedupe(key, async () => {
+        const waiters = coalescer.waiters(key);
+        if (waiters > 0) {
+          stats.recordCoalesce(waiters);
+          events.emit('coalesce', { key, waiters });
+        }
+        const lockHandle = await lock.acquire(key, { ttlMs: 30_000 });
+        try {
+          if (lockHandle.held) return await exec();
           const recheck = await tryGet(key);
           if (recheck) {
             recordHit(request, recheck, key, 'exact');
             return recheck.value as T;
           }
-          return exec();
-        }) as Promise<T>;
-      } finally {
-        await lockHandle.release();
-      }
+          return await exec();
+        } finally {
+          await lockHandle.release();
+        }
+      })) as T;
     },
 
     async wrapStream<TChunk>(
@@ -343,7 +360,7 @@ export function createCache(options: CacheOptions): Cache {
               const { chunks, timings } = await captured;
               const envelope = serializeStreamEnvelope(opts.serializer, chunks, timings);
               const ttlBase = computeTTL(request, opts.ttl);
-              const ttl = applyJitter(ttlBase, ttlJitter);
+              const ttl = applyJitter(ttlBase, ttlJitter, rng);
               const extras: {
                 tags?: readonly string[];
                 meta?: Readonly<Record<string, unknown>>;
@@ -375,7 +392,8 @@ export function createCache(options: CacheOptions): Cache {
         const value = await this.wrap<T>(request, fn, opts);
         return ok(value);
       } catch (e) {
-        return err(wrapError(e, 'wrap'));
+        if (e instanceof CacheError) return err(e);
+        throw e;
       }
     },
 
@@ -388,7 +406,8 @@ export function createCache(options: CacheOptions): Cache {
         const stream = await this.wrapStream<TChunk>(request, fn, opts);
         return ok(stream);
       } catch (e) {
-        return err(wrapError(e, 'wrapStream'));
+        if (e instanceof CacheError) return err(e);
+        throw e;
       }
     },
 
@@ -403,7 +422,7 @@ export function createCache(options: CacheOptions): Cache {
       assertNotDisposed();
       const key = await buildKey(request);
       const ttlBase = computeTTL(request, opts?.ttl);
-      const ttl = applyJitter(ttlBase, ttlJitter);
+      const ttl = applyJitter(ttlBase, ttlJitter, rng);
       const extras: { tags?: readonly string[]; usage?: TokenUsage } = {};
       if (opts?.tags) extras.tags = opts.tags;
       if (opts?.usage) extras.usage = opts.usage;
@@ -482,6 +501,7 @@ export function createCache(options: CacheOptions): Cache {
     },
   };
 
+  cacheRef = cache;
   return cache;
 }
 

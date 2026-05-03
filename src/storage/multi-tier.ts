@@ -7,6 +7,14 @@ import type {
   VectorSearchHit,
 } from '../core/types.js';
 
+export interface MultiTierStorageOptions {
+  /**
+   * Optional clock for deterministic backfill TTL math. Defaults to
+   * `Date.now`. Pass the same clock as `createCache({ clock })` from tests.
+   */
+  readonly clock?: { now(): number };
+}
+
 /**
  * Compose multiple `CacheStorage` tiers into a read-through, write-through
  * cache. Reads try each tier in order; on an L_n hit, every L_<n cache is
@@ -17,6 +25,7 @@ import type {
  * L1 absorbs hot keys and the L2 survives across cold starts.
  *
  * @param tiers Non-empty array of storage backends ordered closest-first.
+ * @param options Optional `clock` for deterministic backfill TTL.
  * @returns A composite `CacheStorage`.
  * @throws {Error} when `tiers` is empty.
  *
@@ -27,11 +36,13 @@ import type {
  */
 export function multiTierStorage(
   tiers: readonly [CacheStorage, ...CacheStorage[]],
+  options: MultiTierStorageOptions = {},
 ): CacheStorage {
   if (tiers.length === 0) throw new Error('multiTierStorage requires at least one tier');
 
   const tierList = [...tiers];
   const capabilities: StorageCapabilities = mergeCapabilities(tierList);
+  const now = options.clock?.now.bind(options.clock) ?? (() => Date.now());
 
   const storage: CacheStorage = {
     name: `multi-tier(${tierList.map((t) => t.name).join(',')})`,
@@ -42,7 +53,7 @@ export function multiTierStorage(
         const entry = await tierList[i]!.get(key);
         if (entry !== undefined) {
           if (i > 0) {
-            const ttlMs = Math.max(0, entry.exp - Date.now());
+            const ttlMs = Math.max(0, entry.exp - now());
             for (let j = 0; j < i; j++) {
               await safeSet(tierList[j]!, key, entry, ttlMs);
             }

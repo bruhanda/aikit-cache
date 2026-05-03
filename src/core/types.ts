@@ -169,6 +169,16 @@ export interface CostSavings {
   readonly savedUSD: number;
 }
 
+/**
+ * Pluggable cost calculator. Implementations return the dollar cost of a
+ * `(model, usage)` pair, or `0` for unknown models. The default
+ * implementation lives at `@aikit/cache/cost` (`defaultCostTracker`) so the
+ * core subpath stays free of the multi-KB pricing table.
+ */
+export interface CostTracker {
+  estimateUSD(model: string, usage: TokenUsage): number;
+}
+
 /** Frozen statistics view returned by `cache.stats()`. */
 export interface CacheStatsSnapshot {
   readonly hits: number;
@@ -243,7 +253,12 @@ export interface CacheOptions {
   readonly ttlJitter?: number;
   readonly namespace?: string;
   readonly keyPolicy?: (request: CacheRequest) => string;
-  readonly costTracking?: boolean;
+  /**
+   * Pluggable cost calculator. When unset, `cache.stats().savedUSD` stays
+   * at `0` and the root subpath ships zero pricing-table bytes. Import
+   * `defaultCostTracker` from `@aikit/cache/cost` to opt in.
+   */
+  readonly costTracker?: CostTracker;
   readonly coalesce?:
     | boolean
     | {
@@ -253,6 +268,11 @@ export interface CacheOptions {
   readonly semantic?: SemanticLayer;
   readonly onError?: 'silent' | 'throw';
   readonly clock?: { now(): number };
+  /**
+   * Random number generator used by TTL jitter. Defaults to `Math.random`.
+   * Override for deterministic tests.
+   */
+  readonly rng?: () => number;
   readonly fetch?: typeof fetch;
 }
 
@@ -324,15 +344,19 @@ export interface Cache {
   ): Promise<ReadableStream<TChunk>>;
 
   /**
-   * Non-throwing mirror of `wrap()` returning a `Result<T, CacheError>`.
-   * Useful when `onError: 'throw'` is the global default but a specific
-   * call site wants graceful handling.
+   * Non-throwing mirror of `wrap()` returning a `Result<T, CacheError>` for
+   * cache-layer failures. Useful when `onError: 'throw'` is the global
+   * default but a specific call site wants graceful handling.
+   *
+   * Live errors thrown by `fn()` propagate through unchanged — they are
+   * provider failures, not cache failures, and the cache layer never
+   * mis-tags them as its own (PLAN §5.2).
    *
    * @param request Provider-neutral request.
    * @param fn Function executed on cache miss.
    * @param options Optional TTL/tags/skip overrides.
    * @returns A `Result` whose error arm carries the typed `CacheError`.
-   * @throws Never throws; live errors from `fn` are wrapped into `Result.err`.
+   * @throws Whatever `fn()` throws.
    */
   tryWrap<T>(
     request: CacheRequest,
@@ -341,12 +365,14 @@ export interface Cache {
   ): Promise<Result<T, CacheError>>;
 
   /**
-   * Non-throwing mirror of `wrapStream()`.
+   * Non-throwing mirror of `wrapStream()` for cache-layer failures. Live
+   * errors from `fn()` propagate unchanged.
    *
    * @param request Provider-neutral request.
    * @param fn Function returning the upstream `ReadableStream`.
    * @param options Required `serializer`; optional `chunkDelayMs`.
    * @returns A `Result` whose error arm carries the typed `CacheError`.
+   * @throws Whatever `fn()` throws.
    */
   tryWrapStream<TChunk>(
     request: CacheRequest,
@@ -437,9 +463,15 @@ export type LLMCache = Cache;
 /**
  * Internal hook used by `createCache` to install the optional semantic
  * layer. Public types only see `withSemantic()` returning a `SemanticLayer`.
+ *
+ * The first argument is a **lazy** getter for the constructed `Cache`. The
+ * cache cannot exist before `_install` is called (it depends on the handle
+ * returned here), so `getCache()` throws if invoked synchronously inside
+ * `_install`. Implementations should capture the getter and call it later
+ * from `lookup` / `index` if they need a back-reference.
  */
 export interface SemanticLayer {
-  readonly _install: (cache: Cache, storage: CacheStorage) => SemanticLayerHandle;
+  readonly _install: (getCache: () => Cache, storage: CacheStorage) => SemanticLayerHandle;
 }
 
 /**
