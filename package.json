@@ -1,0 +1,252 @@
+{
+  "name": "@aikit/cache",
+  "version": "0.1.0",
+  "description": "Zero-dep, type-safe LLM response cache for Node.js, Bun, Deno, browsers, and edge runtimes (Cloudflare Workers, Vercel Edge). Exact-match + optional semantic cache via pluggable embeddings, in-flight single-flight coalescing (with optional distributed lock for multi-pod deployments), per-model TTL, streaming-aware replay, programmatic invalidation by key/prefix/tag, dollar-denominated savings tracker. Pluggable storage (in-memory LRU / Redis / Upstash / Cloudflare KV / Vercel KV / SQLite / Postgres+pgvector). Drop-in adapters for OpenAI, Anthropic, Vercel AI SDK, LangChain.js, Hono, Express, Next.js. Open-source alternative to Helicone / Portkey / Redis LangCache without LangChain coupling.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Mykhailo Kryvytskyi",
+  "homepage": "https://github.com/j09822475-dev/aikit-cache",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/j09822475-dev/aikit-cache.git"
+  },
+  "bugs": {
+    "url": "https://github.com/j09822475-dev/aikit-cache/issues"
+  },
+  "keywords": [
+    "llm",
+    "cache",
+    "llm-cache",
+    "semantic-cache",
+    "prompt-cache",
+    "response-cache",
+    "request-deduplication",
+    "request-coalescing",
+    "single-flight",
+    "openai",
+    "anthropic",
+    "claude",
+    "gpt",
+    "ai",
+    "ai-sdk",
+    "vercel-ai-sdk",
+    "langchain-alternative",
+    "embeddings",
+    "cosine-similarity",
+    "cost-optimization",
+    "cost-tracking",
+    "llmops",
+    "edge-runtime",
+    "cloudflare-workers",
+    "vercel-edge",
+    "bun",
+    "deno",
+    "redis",
+    "upstash",
+    "cloudflare-kv",
+    "sqlite",
+    "postgres",
+    "pgvector",
+    "supabase",
+    "streaming",
+    "ttl",
+    "invalidation",
+    "type-safe",
+    "typescript",
+    "zero-dep",
+    "helicone-alternative",
+    "portkey-alternative",
+    "gptcache-alternative"
+  ],
+  "engines": {
+    "node": ">=18.17.0"
+  },
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "PLAN.md"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./errors": {
+      "types": "./dist/errors/index.d.ts",
+      "import": "./dist/errors/index.js"
+    },
+    "./cost": {
+      "types": "./dist/cost/index.d.ts",
+      "import": "./dist/cost/index.js"
+    },
+    "./semantic": {
+      "types": "./dist/semantic/index.d.ts",
+      "import": "./dist/semantic/index.js"
+    },
+    "./storage": {
+      "types": "./dist/storage/index.d.ts",
+      "import": "./dist/storage/index.js"
+    },
+    "./storage/redis": {
+      "types": "./dist/storage/redis.d.ts",
+      "import": "./dist/storage/redis.js"
+    },
+    "./storage/upstash": {
+      "types": "./dist/storage/upstash.d.ts",
+      "import": "./dist/storage/upstash.js"
+    },
+    "./storage/cloudflare-kv": {
+      "types": "./dist/storage/cloudflare-kv.d.ts",
+      "import": "./dist/storage/cloudflare-kv.js"
+    },
+    "./storage/vercel-kv": {
+      "types": "./dist/storage/vercel-kv.d.ts",
+      "import": "./dist/storage/vercel-kv.js"
+    },
+    "./storage/sqlite": {
+      "types": "./dist/storage/sqlite.d.ts",
+      "import": "./dist/storage/sqlite.js"
+    },
+    "./storage/postgres": {
+      "types": "./dist/storage/postgres.d.ts",
+      "import": "./dist/storage/postgres.js"
+    },
+    "./embeddings": {
+      "types": "./dist/embeddings/index.d.ts",
+      "import": "./dist/embeddings/index.js"
+    },
+    "./embeddings/openai": {
+      "types": "./dist/embeddings/openai.d.ts",
+      "import": "./dist/embeddings/openai.js"
+    },
+    "./embeddings/cohere": {
+      "types": "./dist/embeddings/cohere.d.ts",
+      "import": "./dist/embeddings/cohere.js"
+    },
+    "./embeddings/voyage": {
+      "types": "./dist/embeddings/voyage.d.ts",
+      "import": "./dist/embeddings/voyage.js"
+    },
+    "./adapters/openai": {
+      "types": "./dist/adapters/openai/index.d.ts",
+      "import": "./dist/adapters/openai/index.js"
+    },
+    "./adapters/anthropic": {
+      "types": "./dist/adapters/anthropic/index.d.ts",
+      "import": "./dist/adapters/anthropic/index.js"
+    },
+    "./adapters/ai-sdk": {
+      "types": "./dist/adapters/ai-sdk/index.d.ts",
+      "import": "./dist/adapters/ai-sdk/index.js"
+    },
+    "./adapters/langchain": {
+      "types": "./dist/adapters/langchain/index.d.ts",
+      "import": "./dist/adapters/langchain/index.js"
+    },
+    "./adapters/hono": {
+      "types": "./dist/adapters/hono/index.d.ts",
+      "import": "./dist/adapters/hono/index.js"
+    },
+    "./adapters/express": {
+      "types": "./dist/adapters/express/index.d.ts",
+      "import": "./dist/adapters/express/index.js"
+    },
+    "./adapters/next": {
+      "types": "./dist/adapters/next/index.d.ts",
+      "import": "./dist/adapters/next/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "lint": "eslint \"src/**/*.ts\" \"tests/**/*.ts\"",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:types": "vitest run --typecheck",
+    "test:coverage": "vitest run --coverage",
+    "test:ci": "vitest run --reporter=verbose",
+    "test:ui": "vitest --ui",
+    "size": "size-limit",
+    "format": "prettier --write \"**/*.{ts,md,json}\"",
+    "publint": "publint",
+    "attw": "attw --pack .",
+    "prepublishOnly": "npm run lint && npm run typecheck && npm run test && npm run build && npm run publint && npm run attw && npm run size"
+  },
+  "peerDependencies": {
+    "@anthropic-ai/sdk": ">=0.27.0",
+    "@langchain/core": ">=0.3.0",
+    "@upstash/redis": ">=1.30.0",
+    "@vercel/kv": ">=2.0.0",
+    "ai": ">=3.0.0",
+    "better-sqlite3": ">=11.0.0",
+    "cohere-ai": ">=7.0.0",
+    "express": ">=4.0.0",
+    "hono": ">=4.0.0",
+    "ioredis": ">=5.0.0",
+    "next": ">=14.0.0",
+    "openai": ">=4.0.0",
+    "pg": ">=8.11.0",
+    "postgres": ">=3.4.0"
+  },
+  "peerDependenciesMeta": {
+    "@anthropic-ai/sdk": { "optional": true },
+    "@langchain/core": { "optional": true },
+    "@upstash/redis": { "optional": true },
+    "@vercel/kv": { "optional": true },
+    "ai": { "optional": true },
+    "better-sqlite3": { "optional": true },
+    "cohere-ai": { "optional": true },
+    "express": { "optional": true },
+    "hono": { "optional": true },
+    "ioredis": { "optional": true },
+    "next": { "optional": true },
+    "openai": { "optional": true },
+    "pg": { "optional": true },
+    "postgres": { "optional": true }
+  },
+  "devDependencies": {
+    "@anthropic-ai/sdk": "^0.27.0",
+    "@arethetypeswrong/cli": "^0.16.0",
+    "@cloudflare/vitest-pool-workers": "^0.5.0",
+    "@cloudflare/workers-types": "^4.20240800.0",
+    "@langchain/core": "^0.3.0",
+    "@size-limit/preset-small-lib": "^11.1.0",
+    "@types/express": "^5.0.0",
+    "@types/node": "^20.12.0",
+    "@typescript-eslint/eslint-plugin": "^7.0.0",
+    "@typescript-eslint/parser": "^7.0.0",
+    "@upstash/redis": "^1.30.0",
+    "@vercel/kv": "^2.0.0",
+    "@vitest/coverage-v8": "^2.0.0",
+    "ai": "^3.4.0",
+    "better-sqlite3": "^11.0.0",
+    "cohere-ai": "^7.0.0",
+    "eslint": "^8.57.0",
+    "express": "^5.0.0",
+    "hono": "^4.12.0",
+    "ioredis": "^5.4.0",
+    "ioredis-mock": "^8.9.0",
+    "next": "^15.0.0",
+    "openai": "^4.60.0",
+    "pg": "^8.13.0",
+    "@electric-sql/pglite": "^0.2.0",
+    "postgres": "^3.4.0",
+    "prettier": "^3.2.0",
+    "publint": "^0.2.0",
+    "size-limit": "^11.1.0",
+    "tsup": "^8.3.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.0.0"
+  }
+}

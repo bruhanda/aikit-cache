@@ -1,0 +1,74 @@
+# Source — only `dist/` ships
+src/
+tests/
+test/
+__tests__/
+__mocks__/
+__fixtures__/
+examples/
+example/
+sandbox/
+playground/
+benchmarks/
+bench/
+scripts/
+
+# Build artifacts that don't belong in the package
+coverage/
+.nyc_output/
+.turbo/
+.cache/
+.tsbuildinfo
+*.tsbuildinfo
+
+# Configs (consumers don't need these)
+tsconfig.json
+tsconfig.*.json
+tsup.config.ts
+vitest.config.ts
+vitest.config.*.ts
+.eslintrc*
+eslint.config.*
+.prettierrc*
+prettier.config.*
+.editorconfig
+.size-limit.json
+size-limit.config.*
+.attw.*
+
+# Internal documents
+PLAN.md
+REVIEW.md
+NOTES.md
+TODO.md
+ROADMAP.md
+.github/
+.vscode/
+.idea/
+
+# VCS / CI
+.git/
+.gitignore
+.gitattributes
+.travis.yml
+.circleci/
+.husky/
+.changeset/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.log
+*.swp
+*.swo
+*~
+
+# Lockfiles (npm publishes only the package; lockfiles are dev-only)
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+bun.lockb
+
+# Env files — never publish secrets
+.env
+.env.*
