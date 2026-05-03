@@ -40,6 +40,25 @@ const reply = await cache.wrap(
 
 That's it. Identical requests now return from cache; concurrent ones coalesce; storage failures fall through to the live call.
 
+## Examples
+
+Runnable examples live under [`examples/`](./examples). Each is also packaged as a self-contained StackBlitz sandbox under [`examples/sandbox/`](./examples/sandbox) so you can try the library in your browser without cloning anything.
+
+| Example | What it shows | Try it |
+|---|---|---|
+| [`basic-usage.ts`](./examples/basic-usage.ts) | `createCache` + `memoryStorage` + `wrap()` — hit/miss timings and basic stats. | [![Open in StackBlitz](https://developer.stackblitz.com/img/open_in_stackblitz.svg)](https://stackblitz.com/github/bruhanda/aikit-cache/tree/main/examples/sandbox/basic-usage) |
+| [`advanced-usage.ts`](./examples/advanced-usage.ts) | Multi-tier storage, semantic match, single-flight coalescing, tag invalidation, dollar-denominated savings. | [![Open in StackBlitz](https://developer.stackblitz.com/img/open_in_stackblitz.svg)](https://stackblitz.com/github/bruhanda/aikit-cache/tree/main/examples/sandbox/advanced-usage) |
+| [`with-hono.ts`](./examples/with-hono.ts) | Hono `cacheMiddleware` in front of a `/v1/chat/completions` route — works on Node, Bun, Workers, Vercel Edge. | [![Open in StackBlitz](https://developer.stackblitz.com/img/open_in_stackblitz.svg)](https://stackblitz.com/github/bruhanda/aikit-cache/tree/main/examples/sandbox/with-hono) |
+| [`with-nextjs.ts`](./examples/with-nextjs.ts) | `withCache()` wrapping a Next.js Route Handler — drop-in caching for `app/api/.../route.ts`. | [![Open in StackBlitz](https://developer.stackblitz.com/img/open_in_stackblitz.svg)](https://stackblitz.com/github/bruhanda/aikit-cache/tree/main/examples/sandbox/with-nextjs) |
+
+Run any example locally with:
+
+```bash
+npx tsx examples/basic-usage.ts
+```
+
+No API keys are required — every example uses a stub LLM so the demo is deterministic and runs anywhere Node 18.17+ does.
+
 ## Installation
 
 ```bash
