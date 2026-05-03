@@ -175,6 +175,7 @@
     "test:watch": "vitest",
     "test:types": "vitest run --typecheck",
     "test:coverage": "vitest run --coverage",
+    "test:ci": "vitest run --reporter=verbose",
     "test:ui": "vitest --ui",
     "size": "size-limit",
     "format": "prettier --write \"**/*.{ts,md,json}\"",
