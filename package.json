@@ -1,7 +1,7 @@
 {
   "name": "@aikit/cache",
   "version": "0.1.0",
-  "description": "Zero-dep, type-safe LLM response cache for Node.js, Bun, Deno, browsers, and edge runtimes (Cloudflare Workers, Vercel Edge). Exact-match + optional semantic cache via pluggable embeddings, in-flight single-flight coalescing, per-model TTL, streaming-aware replay, programmatic invalidation by key/prefix/tag, dollar-denominated savings tracker. Pluggable storage (in-memory LRU / Redis / Upstash / Cloudflare KV / Vercel KV / SQLite). Drop-in adapters for OpenAI, Anthropic, Vercel AI SDK, LangChain.js, Hono, Express, Next.js. Open-source alternative to Helicone / Portkey / Redis LangCache without LangChain coupling.",
+  "description": "Zero-dep, type-safe LLM response cache for Node.js, Bun, Deno, browsers, and edge runtimes (Cloudflare Workers, Vercel Edge). Exact-match + optional semantic cache via pluggable embeddings, in-flight single-flight coalescing (with optional distributed lock for multi-pod deployments), per-model TTL, streaming-aware replay, programmatic invalidation by key/prefix/tag, dollar-denominated savings tracker. Pluggable storage (in-memory LRU / Redis / Upstash / Cloudflare KV / Vercel KV / SQLite / Postgres+pgvector). Drop-in adapters for OpenAI, Anthropic, Vercel AI SDK, LangChain.js, Hono, Express, Next.js. Open-source alternative to Helicone / Portkey / Redis LangCache without LangChain coupling.",
   "type": "module",
   "license": "MIT",
   "author": "Mykhailo Kryvytskyi",
@@ -45,6 +45,9 @@
     "upstash",
     "cloudflare-kv",
     "sqlite",
+    "postgres",
+    "pgvector",
+    "supabase",
     "streaming",
     "ttl",
     "invalidation",
@@ -108,6 +111,10 @@
     "./storage/sqlite": {
       "types": "./dist/storage/sqlite.d.ts",
       "import": "./dist/storage/sqlite.js"
+    },
+    "./storage/postgres": {
+      "types": "./dist/storage/postgres.d.ts",
+      "import": "./dist/storage/postgres.js"
     },
     "./embeddings": {
       "types": "./dist/embeddings/index.d.ts",
@@ -187,7 +194,9 @@
     "hono": ">=4.0.0",
     "ioredis": ">=5.0.0",
     "next": ">=14.0.0",
-    "openai": ">=4.0.0"
+    "openai": ">=4.0.0",
+    "pg": ">=8.11.0",
+    "postgres": ">=3.4.0"
   },
   "peerDependenciesMeta": {
     "@anthropic-ai/sdk": { "optional": true },
@@ -201,7 +210,9 @@
     "hono": { "optional": true },
     "ioredis": { "optional": true },
     "next": { "optional": true },
-    "openai": { "optional": true }
+    "openai": { "optional": true },
+    "pg": { "optional": true },
+    "postgres": { "optional": true }
   },
   "devDependencies": {
     "@anthropic-ai/sdk": "^0.27.0",
@@ -227,6 +238,9 @@
     "ioredis-mock": "^8.9.0",
     "next": "^15.0.0",
     "openai": "^4.60.0",
+    "pg": "^8.13.0",
+    "@electric-sql/pglite": "^0.2.0",
+    "postgres": "^3.4.0",
     "prettier": "^3.2.0",
     "publint": "^0.2.0",
     "size-limit": "^11.1.0",

@@ -82,7 +82,8 @@ aikit-cache/
 │   │   ├── cloudflare-kv.ts            # Cloudflare Workers KV adapter
 │   │   ├── vercel-kv.ts                # Vercel KV adapter (uses @vercel/kv shape, peer dep)
 │   │   ├── sqlite.ts                   # better-sqlite3 adapter (Node-only, peer dep, lazy import)
-│   │   └── types.ts                    # `CacheStorage`, `BatchOps`, `VectorCapabilities`
+│   │   ├── postgres.ts                 # Postgres + pgvector adapter (Node-only, peer dep `pg` or `postgres`, lazy import)
+│   │   └── types.ts                    # `CacheStorage`, `BatchOps`, `VectorCapabilities`, `TransformAtRest`, `DistributedLock`
 │   │
 │   ├── embeddings/
 │   │   ├── index.ts                    # public barrel — `customEmbeddings()` (bring-your-own function), `EmbeddingProvider` type
@@ -106,7 +107,7 @@ aikit-cache/
 │   │   │   ├── index.ts                # `LangChainCache` extends `BaseCache` from `@langchain/core/caches`
 │   │   │   └── types.ts
 │   │   ├── hono/
-│   │   │   └── index.ts                # `cacheHandler({ cache })` Hono middleware for /v1/chat/completions-style routes
+│   │   │   └── index.ts                # `cacheMiddleware({ cache })` Hono middleware for /v1/chat/completions-style routes
 │   │   ├── express/
 │   │   │   └── index.ts                # `cacheMiddleware({ cache })` Express request middleware
 │   │   └── next/
@@ -163,7 +164,8 @@ aikit-cache/
 │   │   ├── redis.test.ts               # uses ioredis-mock
 │   │   ├── upstash.test.ts             # mocks fetch
 │   │   ├── cloudflare-kv.test.ts       # KVNamespace fake
-│   │   └── sqlite.test.ts              # node-only, skipped in edge pool
+│   │   ├── sqlite.test.ts              # node-only, skipped in edge pool
+│   │   └── postgres.test.ts            # node-only, uses pglite for in-memory pgvector
 │   ├── embeddings/
 │   │   ├── openai.test.ts              # mocks fetch
 │   │   ├── cohere.test.ts              # mocks fetch
@@ -229,16 +231,16 @@ aikit-cache/
 
 | Path | Responsibility |
 |---|---|
-| `src/index.ts` | Root barrel — re-exports `createCache`, `CacheError` base, `Result`, `isOk`, `isErr`, core types (`CacheRequest`, `CacheEntry`, `CacheOptions`, `WrapOptions`, `LLMCache`, `Chunk`). Does NOT re-export semantic/cost/storage/embeddings/adapters (forces tree-shakeable subpath imports). |
-| `src/core/cache.ts` | `createCache(options)` factory. Returns the immutable `LLMCache<T>` interface implementing `wrap`, `wrapStream`, `get`, `set`, `delete`, `invalidate`, `clear`, `stats`, `on`, `dispose`. Wires the storage, coalescing map, cost tracker, event bus, and TTL resolver. Constructor validation throws `ConfigError`. |
+| `src/index.ts` | Root barrel — re-exports `createCache`, `CacheError` base, `Result`, `isOk`, `isErr`, core types (`CacheRequest`, `CacheEntry`, `CacheOptions`, `WrapOptions`, `Cache`, `LLMCache` alias, `Chunk`). Does NOT re-export semantic/cost/storage/embeddings/adapters (forces tree-shakeable subpath imports). |
+| `src/core/cache.ts` | `createCache(options)` factory. Returns the immutable `Cache` interface (aliased as `LLMCache`) implementing `wrap`, `wrapStream`, `tryWrap`, `tryWrapStream`, `get`, `set`, `delete`, `invalidate`, `clear`, `stats`, `resetStats`, `on`, `flush`, `dispose`. Wires the storage, coalescing map (with optional `DistributedLock`), cost tracker, event bus, and TTL resolver. Constructor validation throws `ConfigError`. |
 | `src/core/key.ts` | `hashRequest(req, opts?)` — async SHA-256 over the canonical serialization. Returns a base64url-encoded 256-bit digest plus the namespace prefix (`<namespace>:<model>:<digest>`). The function shape is `Promise<string>` because `SubtleCrypto.digest` is async; documented as a non-issue inside the already-async `wrap()` flow. |
-| `src/core/canonical.ts` | `canonicalize(req)` — produces a deterministic UTF-8 string for hashing. Sorts object keys recursively, normalizes whitespace inside content where requested, strips `WrapOptions.ignoreFields` (default: `['id', 'request_id', 'metadata.timestamp']`), and drops streaming/non-determinism flags. Pure, sync. |
+| `src/core/canonical.ts` | `canonicalize(req)` — produces a deterministic UTF-8 string for hashing. Sorts object keys recursively, normalizes whitespace inside content where requested, strips `WrapOptions.ignoreFields` (default: `['id', 'request_id', 'metadata']` — the entire `metadata` subtree is dropped, not just nested timestamps), validates `messages` XOR `input`, and drops streaming/non-determinism flags. Pure, sync. |
 | `src/core/ttl.ts` | `resolveTTL({ model, namespace, override })` — picks the longest matching rule from `perModelTTL` → `perNamespaceTTL` → `default`. Adds optional ±10% jitter to prevent thundering-herd expiry. |
 | `src/core/coalesce.ts` | `Coalescer<K, V>` — single-flight map. `dedupe(key, fn)` returns the in-flight `Promise<V>` if any caller is already computing `key`, otherwise calls `fn()`, stores the promise, and clears it after settle (via `.finally`). Resolution-order safe across rapid call/release/call cycles. |
 | `src/core/invalidate.ts` | Pattern matchers for `{ key }`, `{ prefix }`, `{ tag }`, `{ predicate }`, plus `clear()`. Maps each pattern to the storage adapter's most-efficient operation (Redis `SCAN`+`DEL`, KV bulk delete, in-memory iterate). |
 | `src/core/stream.ts` | `wrapStream(req, fn)` returns `ReadableStream<TChunk>`. On miss, tees the upstream stream via `ReadableStream.tee()`: one branch flows to the consumer, the other accumulates chunks; on upstream `close`, the accumulated array is serialized and stored. On hit, replays from a serialized array via a simulated `ReadableStream` with optional `chunkDelayMs` to mimic original cadence. Pluggable `ChunkSerializer<TChunk>`. |
 | `src/core/stats.ts` | `CacheStats` — atomic counters per total + per model. `snapshot()` returns a frozen view: `{ hits, misses, hitRate, errors, savedTokens, savedUSD, byModel, since, until }`. |
-| `src/core/envelope.ts` | Versioned wire format. `CacheEntry<T> = { v: 1; value: T; exp: number; createdAt: number; tags?: string[]; meta?: Record<string, unknown>; usage?: TokenUsage }`. Loaders that see `v !== 1` treat the entry as missing (forward-compat for v0.2 schema bumps). |
+| `src/core/envelope.ts` | Versioned wire format. `CacheEntry<T> = { v: 1; value: T; exp: number; createdAt: number; tags?: string[]; meta?: { serializerId?: string; [k: string]: unknown }; usage?: TokenUsage }`. Streaming entries set `meta.serializerId` (a stable string declared by the `ChunkSerializer`); replay refuses if the configured serializer's id doesn't match (`STREAM_REPLAY_FAILED`) — explicit miss instead of silently feeding garbage to a wrong deserializer. Loaders that see `v !== 1` treat the entry as missing (forward-compat for v0.2 schema bumps). |
 | `src/core/events.ts` | `EventBus<E>` — `on(event, listener): () => void` (sync unsubscribe). Events: `'hit' \| 'miss' \| 'set' \| 'evict' \| 'error' \| 'coalesce'`. Errors thrown inside listeners are caught and re-emitted as `'error'` to prevent listener crashes from killing the cache. |
 | `src/semantic/layer.ts` | `SemanticLayer<T>` — wraps a base `LLMCache<T>`. On miss, embeds the canonical representation of the request, performs cosine search across the storage's vector index (or in-memory linear scan), returns the highest-similarity hit above `threshold`. Falls through to the underlying `wrap()` on no match. |
 | `src/semantic/similarity.ts` | `cosineSimilarity(a, b)` (assumes pre-normalized vectors), `normalize(v)`, `topK(scores, k)`. SIMD-friendly tight loop, ~50 LOC. |
@@ -255,6 +257,7 @@ aikit-cache/
 | `src/storage/cloudflare-kv.ts` | `cloudflareKVStorage(KVNamespace)` — uses `KV.get`/`put`/`delete`/`list` with TTL passed via `expirationTtl`. |
 | `src/storage/vercel-kv.ts` | `vercelKVStorage({ client })` — for `@vercel/kv` shape. |
 | `src/storage/sqlite.ts` | `sqliteStorage({ database })` — Node-only. Lazy `await import('better-sqlite3')`. Uses a single table `cache (key TEXT PRIMARY KEY, value BLOB, exp INTEGER, tags TEXT)` and prepared statements. |
+| `src/storage/postgres.ts` | `postgresStorage({ client, vectorColumn? })` — Node-only. Accepts a `pg`/`postgres`-shaped client (peer dep). Schema: `cache (key TEXT PK, value BYTEA, exp BIGINT, tags TEXT[])`, optional `embedding vector(N)` column when `vectorColumn` is set. With pgvector enabled, advertises `capabilities.vectorSearch === true` and routes ANN queries to `<-> ` cosine distance — the most popular vector store in the JS RAG stack (Supabase) and the missing entry in the v0.1 storage map. |
 | `src/embeddings/openai.ts` | `openaiEmbeddings({ apiKey, model?, fetch?, baseUrl? })`. Default model `text-embedding-3-small`. Auto-batches a single `embed([])` call up to 2048 inputs (OpenAI hard limit). |
 | `src/embeddings/cohere.ts` | `cohereEmbeddings({ apiKey, model?, inputType? })`. |
 | `src/embeddings/voyage.ts` | `voyageEmbeddings({ apiKey, model? })` — REST, no SDK required. |
@@ -263,7 +266,7 @@ aikit-cache/
 | `src/adapters/anthropic/index.ts` | `wrapAnthropic(client, { cache })` — Proxy wrapping `messages.create` and `messages.stream`. |
 | `src/adapters/ai-sdk/index.ts` | `cacheMiddleware({ cache, namespace? })` returns a `LanguageModelV3Middleware` consumed by `wrapLanguageModel(model, { middleware })`. Hooks `wrapGenerate` (exact-match cache) and `wrapStream` (cached replay via `simulateReadableStream`). |
 | `src/adapters/langchain/index.ts` | `LangChainCache` extends `BaseCache` from `@langchain/core/caches`. Implements `lookup(prompt, llmKey)` and `update(prompt, llmKey, value)`. |
-| `src/adapters/hono/index.ts` | `cacheHandler({ cache })` Hono middleware that intercepts `/v1/chat/completions`-style POST routes proxied to a backend. |
+| `src/adapters/hono/index.ts` | `cacheMiddleware({ cache })` Hono middleware that intercepts `/v1/chat/completions`-style POST routes proxied to a backend. |
 | `src/adapters/express/index.ts` | Express equivalent. |
 | `src/adapters/next/index.ts` | `withCache(handler, { cache })` wraps a Route Handler `(req: Request) => Response`. |
 | `src/errors/base.ts` | `abstract class CacheError extends Error { abstract readonly code: ErrorCode; ... }`. `ErrorCode` is a literal union of all error codes. |
@@ -282,6 +285,12 @@ aikit-cache/
 > All snippets below are **runnable user code**. They illustrate the final public surface. JSDoc comments are reproduced verbatim from the planned source so the reader can audit the contract.
 
 ### 2.1 The `createCache()` factory
+
+> **Secure-defaults checklist** (see §9.12 for the full list).
+>
+> - **`namespace` (or `keyPolicy`) is required when storage is shared.** Multi-tenant SaaS sharing a Redis between tenants and forgetting `namespace` is a data-leak vector. The recommended pattern is `keyPolicy: (req) => `tenant:${req.metadata.tenantId}`` so the segregation lives in one place and cannot be forgotten on a single call site.
+> - **`transformAtRest` for sensitive data.** Cached LLM responses can contain PII; enable the `transformAtRest` hook (see §2.2) for AES-GCM-with-KMS when the storage is shared with non-LLM systems or audited under SOC 2 / HIPAA.
+> - **`onError: 'silent'` is the default**, by design — a flaky cache must not bring down the LLM call path. Wire `cache.on('error', …)` to your metrics so silent fall-throughs are still visible.
 
 ```ts
 import { createCache } from '@aikit/cache';
@@ -324,7 +333,7 @@ const cache = createCache({
  *   params: { temperature: 0 },
  * }, () => openai.chat.completions.create({ ... }));
  */
-export function createCache(options: CacheOptions): LLMCache;
+export function createCache(options: CacheOptions): Cache;
 
 export interface CacheOptions {
   /** Storage backend. Required. Use `memoryStorage()` for a quick start. */
@@ -342,8 +351,35 @@ export interface CacheOptions {
   /** Default ±10% jitter on TTL to prevent thundering-herd expiry. Set `0` to disable. */
   readonly ttlJitter?: number;
 
-  /** Optional namespace mixed into every cache key. Lets you isolate caches per tenant / feature. */
+  /**
+   * Namespace mixed into every cache key. Required in any deployment
+   * where the storage backend is shared across tenants, features, or
+   * environments (`prod`/`staging`); strongly recommended otherwise.
+   *
+   * Forgetting `namespace` on a Redis shared between two tenants is a
+   * classic data-leak path. For multi-tenant SaaS prefer `keyPolicy`,
+   * which lets you derive the namespace from the request itself (e.g. a
+   * tenant id pulled from `request.metadata.tenantId`) so it cannot be
+   * forgotten on a single call site.
+   */
   readonly namespace?: string;
+
+  /**
+   * Programmatic namespace derivation per request. Wins over `namespace`
+   * and `CacheRequest.namespace`. Use this in multi-tenant deployments
+   * to enforce that every key is bucketed by tenant — the cache will
+   * throw `CONFIG_INVALID_NAMESPACE` if `keyPolicy` returns an empty
+   * string, so a missing tenant id fails loudly instead of silently
+   * mixing data across tenants.
+   *
+   * @example
+   * keyPolicy: (req) => {
+   *   const tenant = req.metadata?.tenantId;
+   *   if (typeof tenant !== 'string') throw new Error('tenantId required');
+   *   return `tenant:${tenant}`;
+   * }
+   */
+  readonly keyPolicy?: (request: CacheRequest) => string;
 
   /** Track saved tokens / dollars per model. Default `true`. */
   readonly costTracking?: boolean;
@@ -352,8 +388,21 @@ export interface CacheOptions {
    * Single-flight in-flight request deduplication. When 50 callers ask for
    * the same key concurrently, only the first calls `fn()`; the other 49
    * await its result. Default `true`.
+   *
+   * Pass an object to configure:
+   *   - `lock` — pluggable distributed lock to share single-flight ACROSS
+   *     processes (50-pod deployments otherwise fan a burst into 50
+   *     concurrent `fn()` calls; the in-process map only dedupes within
+   *     one Node/Worker instance). Default: an in-process no-op lock.
+   *     Ship-with-the-lib implementations: `redisLock(client)` from
+   *     `./storage/redis`, `upstashLock({ url, token })` from
+   *     `./storage/upstash`. The interface is ~10 LOC so users can BYO.
+   *   - `abortPolicy` — see `WrapOptions.signal`. Default `'leader-only'`.
    */
-  readonly coalesce?: boolean;
+  readonly coalesce?: boolean | {
+    readonly lock?: DistributedLock;
+    readonly abortPolicy?: 'leader-only' | 'shared';
+  };
 
   /**
    * Optional semantic layer. See `@aikit/cache/semantic`.
@@ -396,6 +445,30 @@ export interface TTLPolicy {
   /** Maximum age beyond which a sliding entry will not be refreshed (ms). */
   readonly maxAgeMs?: number;
 }
+
+/**
+ * Pluggable distributed mutex used to share single-flight coalescing across
+ * processes. The contract is intentionally narrow — `acquire()` should
+ * resolve when the lock is held (or rejected on timeout); the returned
+ * `release()` must be safe to call multiple times.
+ *
+ * Implementations ship under `./storage/redis` (`redisLock(client)`) and
+ * `./storage/upstash` (`upstashLock({ url, token })`). The default lock
+ * inside `createCache` is an in-process no-op — single-flight still works
+ * within one runtime, but multi-pod deployments fall back to per-pod
+ * coalescing unless a real lock is supplied.
+ */
+export interface DistributedLock {
+  /**
+   * Acquire the lock for `key`. Implementations should set a TTL on the
+   * underlying lock entry equal to a reasonable upper bound on `fn()`'s
+   * duration (e.g. 30 s) so a crashed leader doesn't deadlock the cluster.
+   */
+  acquire(key: string, opts?: { readonly waitMs?: number; readonly ttlMs?: number }): Promise<{
+    readonly held: boolean;
+    readonly release: () => Promise<void>;
+  }>;
+}
 ```
 
 The returned `LLMCache`:
@@ -407,8 +480,14 @@ The returned `LLMCache`:
  * `wrap<T>` is the headline method. `wrapStream<T>` adds streaming. The
  * primitive `get`/`set`/`delete` are exposed for advanced uses (custom
  * adapters, manual cache warming).
+ *
+ * **Naming.** The interface is exported as both `Cache` (canonical) and
+ * `LLMCache` (alias, for npm SEO and to communicate intent at the call
+ * site). Use whichever reads better — half the use cases (tool-call dedup,
+ * embedding cache, RAG retrieval cache) are not strictly "LLM" responses,
+ * so `Cache` ages better; `LLMCache` is the discoverable name.
  */
-export interface LLMCache {
+export interface Cache {
   /**
    * Cache the result of `fn()` keyed by the canonical hash of `request`.
    *
@@ -460,6 +539,25 @@ export interface LLMCache {
   ): Promise<ReadableStream<TChunk>>;
 
   /**
+   * Non-throwing mirror of `wrap()`. Returns a `Result<T, CacheError>`
+   * instead of letting cache-layer errors throw, regardless of the
+   * `onError` setting. Live errors thrown by `fn()` are still propagated
+   * (they are wrapped into `Result.err` so callers don't have to mix
+   * try/catch with discriminated-union handling).
+   *
+   * Useful when `onError: 'throw'` is enabled globally but a specific call
+   * site wants graceful handling.
+   */
+  tryWrap<T>(request: CacheRequest, fn: () => Promise<T>, options?: WrapOptions): Promise<Result<T, CacheError>>;
+
+  /** Non-throwing mirror of `wrapStream()`. */
+  tryWrapStream<TChunk>(
+    request: CacheRequest,
+    fn: () => Promise<ReadableStream<TChunk>> | ReadableStream<TChunk>,
+    options: WrapStreamOptions<TChunk>,
+  ): Promise<Result<ReadableStream<TChunk>, CacheError>>;
+
+  /**
    * Low-level get. Returns the cached value if a non-expired entry exists,
    * else `undefined`. Does NOT trigger coalescing (use `wrap` for that).
    */
@@ -500,12 +598,33 @@ export interface LLMCache {
   on<E extends CacheEventName>(event: E, listener: CacheEventListener<E>): () => void;
 
   /**
-   * Async cleanup — drains in-flight coalescing entries, awaits storage
-   * `dispose()`, removes event listeners. After `dispose()`, the cache
-   * throws `ConfigError(CACHE_DISPOSED)` on every method.
+   * Await every pending background write (e.g. streaming-capture writes
+   * that the cache fires-and-forgets, Cloudflare KV writes scheduled via
+   * `ctx.waitUntil()`). Edge handlers should call this before returning a
+   * `Response` if they need writes to be durable across early termination.
+   *
+   * Cheap to call and idempotent — resolves immediately if there's
+   * nothing in flight.
+   */
+  flush(): Promise<void>;
+
+  /**
+   * Async cleanup — `flush()`es pending writes, drains in-flight coalescing
+   * entries, awaits storage `dispose()`, removes event listeners. After
+   * `dispose()`, the cache throws `ConfigError(CACHE_DISPOSED)` on every
+   * method.
    */
   dispose(): Promise<void>;
 }
+
+/**
+ * Alias of {@link Cache}. Re-exported under both names so existing
+ * `LLMCache`-typed call sites keep working and so the npm package surfaces
+ * the discoverable LLM-flavored name. New code should prefer `Cache` —
+ * tool-call dedup / embedding cache / RAG retrieval cache are not strictly
+ * "LLM" responses but live on the same primitive.
+ */
+export type LLMCache = Cache;
 ```
 
 The request shape:
@@ -518,21 +637,42 @@ The request shape:
  * requests with different key orders or non-deterministic metadata produce
  * the same cache key.
  *
- * Fields beyond `model` / `messages` / `params` are optional — the canonical
- * form always includes them when present, so passing `{ model, messages,
- * params: { temperature: 0 } }` and `{ model, messages, params: {
- * temperature: 0, top_p: 1 } }` produce DIFFERENT keys (a deliberate
- * choice — different params can produce different completions).
+ * Exactly one of `messages` (chat-shaped requests) OR `input` (everything
+ * else: embeddings, audio, image gen, agent tool-call payloads, OpenAI
+ * `responses.create`, …) must be supplied. The canonicalizer hashes
+ * whichever is provided, so adapters never need to smuggle non-message
+ * data through `params` (which would defeat invalidation by-prefix and
+ * by-tag patterns).
+ *
+ * Fields beyond `model` / `messages` / `input` / `params` are optional —
+ * the canonical form always includes them when present, so passing
+ * `{ model, messages, params: { temperature: 0 } }` and
+ * `{ model, messages, params: { temperature: 0, top_p: 1 } }` produce
+ * DIFFERENT keys (a deliberate choice — different params can produce
+ * different completions).
  */
 export interface CacheRequest {
   readonly model: string;
-  readonly messages: readonly ChatMessage[];
+  /** Chat-shaped requests. Mutually exclusive with `input`. */
+  readonly messages?: readonly ChatMessage[];
+  /**
+   * Non-chat payloads — embeddings inputs, audio buffers (base64), image
+   * prompts, agent tool-call args, anything that isn't a chat conversation.
+   * Hashed via the same canonicalizer as `messages`. Mutually exclusive
+   * with `messages` (passing both throws `CACHE_INVALID_OPTIONS`).
+   */
+  readonly input?: unknown;
   readonly params?: Readonly<Record<string, unknown>>;
   /** Optional namespace that overrides `CacheOptions.namespace` for this call. */
   readonly namespace?: string;
   /** Optional tools / functions; included in the hash. */
   readonly tools?: readonly Readonly<Record<string, unknown>>[];
-  /** Free-form metadata excluded from the hash by default; useful for cost tracking. */
+  /**
+   * Free-form metadata. Excluded from the hash by default — the entire
+   * `metadata` subtree is in `WrapOptions.ignoreFields`'s default. Useful
+   * for cost tracking, request IDs, trace spans, anything that should ride
+   * along with the entry without affecting the cache key.
+   */
   readonly metadata?: Readonly<Record<string, unknown>>;
 }
 
@@ -549,6 +689,26 @@ export interface WrapOptions {
   readonly ignoreFields?: readonly string[];
   /** Override the cost-tracking `usage` recorded for this call. */
   readonly usage?: TokenUsage;
+  /**
+   * Optional `AbortSignal` forwarded into `fn()` and observed by the cache.
+   *
+   * Semantics with single-flight coalescing on (the default):
+   *
+   *   - **Leader aborts** (the caller whose `fn()` is actually running):
+   *     by default (`coalesce.abortPolicy: 'leader-only'`), the leader's
+   *     promise rejects with `AbortError`, every waiter ALSO rejects (they
+   *     have no upstream call to fall back to). The next caller after
+   *     rejection performs a fresh call. Set `coalesce.abortPolicy: 'shared'`
+   *     to instead promote the first remaining waiter to leader and let it
+   *     issue a fresh `fn()` call (best-effort; the original signal is
+   *     dropped).
+   *   - **Waiter aborts** (a non-leader caller): the waiter's promise
+   *     rejects with `AbortError`. The leader's `fn()` continues; other
+   *     waiters are unaffected.
+   *
+   * Documented in §9.3.
+   */
+  readonly signal?: AbortSignal;
 }
 
 export interface SetOptions {
@@ -570,6 +730,17 @@ export interface WrapStreamOptions<TChunk> extends WrapOptions {
 }
 
 export interface ChunkSerializer<TChunk> {
+  /**
+   * Stable, unique identifier for this serializer's wire format
+   * (e.g. `'openai-stream-v1'`, `'anthropic-stream-v1'`,
+   * `'ai-sdk-stream-v1'`). Stamped onto every cached streaming envelope's
+   * `meta.serializerId`; on replay, the cache refuses to deserialize an
+   * entry whose stored id does not match the configured serializer's id
+   * (returns `STREAM_REPLAY_FAILED`). Without this, two serializers that
+   * happen to consume the same wire shape (both JSON arrays, say) would
+   * silently feed garbage into the wrong deserializer.
+   */
+  readonly id: string;
   serialize(chunks: readonly TChunk[]): string | Uint8Array;
   deserialize(data: string | Uint8Array): readonly TChunk[];
 }
@@ -708,23 +879,115 @@ export interface MemoryStorageOptions {
 }
 
 // @aikit/cache/storage/redis
-export function redisStorage(options: { client: RedisLikeClient; keyPrefix?: string }): CacheStorage;
+export function redisStorage(options: {
+  readonly client: RedisLikeClient;
+  readonly keyPrefix?: string;
+  readonly transformAtRest?: TransformAtRest;
+}): CacheStorage;
+/** Redis-backed `DistributedLock` using `SET key val NX PX ttl` + Lua release. */
+export function redisLock(client: RedisLikeClient, opts?: { readonly keyPrefix?: string }): DistributedLock;
 
 // @aikit/cache/storage/upstash
 export function upstashStorage(options:
-  | { url: string; token: string; fetch?: typeof fetch; keyPrefix?: string }
-  | { client: UpstashClient; keyPrefix?: string }
+  | { readonly url: string; readonly token: string; readonly fetch?: typeof fetch; readonly keyPrefix?: string; readonly transformAtRest?: TransformAtRest }
+  | { readonly client: UpstashClient; readonly keyPrefix?: string; readonly transformAtRest?: TransformAtRest }
 ): CacheStorage;
+/** Upstash REST `DistributedLock` (edge-safe). */
+export function upstashLock(options: { readonly url: string; readonly token: string; readonly keyPrefix?: string }): DistributedLock;
 
 // @aikit/cache/storage/cloudflare-kv
-export function cloudflareKVStorage(kv: KVNamespace, options?: { keyPrefix?: string }): CacheStorage;
+export function cloudflareKVStorage(
+  kv: KVNamespace,
+  options?: {
+    readonly keyPrefix?: string;
+    /**
+     * Cloudflare `ExecutionContext` from the request handler. When present,
+     * KV `put()` writes are wrapped in `ctx.waitUntil(...)` so the Worker
+     * doesn't terminate before the write resolves. Without this, a write
+     * issued during a request handler that returns immediately can be
+     * killed by the runtime, and the next caller will silent-miss.
+     *
+     * In Workers code:
+     *
+     * ```ts
+     * export default {
+     *   fetch(req, env, ctx) {
+     *     const cache = createCache({
+     *       storage: cloudflareKVStorage(env.KV, { ctx }),
+     *     });
+     *     // ... handler logic, then return Response (writes are durable
+     *     // because ctx.waitUntil keeps the Worker alive long enough)
+     *   }
+     * };
+     * ```
+     *
+     * If you can't (or don't want to) thread `ctx` through, call
+     * `await cache.flush()` before returning the `Response` — `flush()`
+     * awaits every pending background write directly. See `LLMCache.flush`.
+     */
+    readonly ctx?: ExecutionContext;
+    readonly transformAtRest?: TransformAtRest;
+  },
+): CacheStorage;
 
 // @aikit/cache/storage/vercel-kv
-export function vercelKVStorage(options: { client: VercelKVClient; keyPrefix?: string }): CacheStorage;
+export function vercelKVStorage(options: {
+  readonly client: VercelKVClient;
+  readonly keyPrefix?: string;
+  readonly transformAtRest?: TransformAtRest;
+}): CacheStorage;
 
 // @aikit/cache/storage/sqlite
-export function sqliteStorage(options: { database: SqliteDatabase; tableName?: string }): CacheStorage;
+export function sqliteStorage(options: {
+  readonly database: SqliteDatabase;
+  readonly tableName?: string;
+  readonly transformAtRest?: TransformAtRest;
+}): CacheStorage;
+
+// @aikit/cache/storage/postgres
+/**
+ * Postgres + pgvector storage adapter. Stores entries in a `cache` table
+ * (TEXT key, BYTEA value, BIGINT exp, TEXT[] tags) with prepared
+ * statements; if the `vector` extension is enabled and `vectorColumn` is
+ * set, advertises `capabilities.vectorSearch === true` so the semantic
+ * layer routes ANN queries to `<-> ` cosine distance instead of falling
+ * back to in-process `MemoryVectorIndex`.
+ *
+ * Edge runtimes: not supported (uses `pg`/`postgres` driver, Node-only).
+ */
+export function postgresStorage(options: {
+  readonly client: PostgresLikeClient;
+  readonly tableName?: string;
+  readonly vectorColumn?: { readonly name: string; readonly dimensions: number };
+  readonly transformAtRest?: TransformAtRest;
+}): CacheStorage;
 ```
+
+#### Encryption / transform at rest
+
+Every shipped storage adapter accepts an optional `transformAtRest` hook:
+
+```ts
+/**
+ * Optional encode/decode pair applied immediately before `set()` and
+ * immediately after `get()`. Used to AES-GCM-encrypt cache values with
+ * a KMS key, gzip-compress large payloads, or apply any other byte-level
+ * transformation without forking the storage adapter.
+ *
+ * Round-trip is `decode(encode(entryBytes)) === entryBytes`. The cache
+ * layer never inspects the bytes; it only round-trips them through this
+ * pair when persisting / loading.
+ *
+ * Cached LLM responses can contain PII. Audit teams will ask
+ * "is the value encrypted at rest?" and `transformAtRest` is the answer.
+ */
+export interface TransformAtRest {
+  encode(bytes: Uint8Array): Uint8Array | Promise<Uint8Array>;
+  decode(bytes: Uint8Array): Uint8Array | Promise<Uint8Array>;
+}
+```
+
+The hook is per-adapter rather than core-wide so adapters that have a native at-rest encryption story (e.g. enterprise Redis with TLS + disk encryption) don't pay any byte-shuffling cost; consumers opt in only on the storages they care about.
 
 ### 2.3 Semantic cache — `@aikit/cache/semantic`
 
@@ -749,7 +1012,7 @@ const cache = createCache({
       apiKey: env.OPENAI_API_KEY,
       model: 'text-embedding-3-small',
     }),
-    threshold: 0.94,                          // cosine similarity in [0, 1]; sweet spot 0.92–0.95
+    threshold: 0.95,                          // cosine similarity in [0, 1]; default; opt-in 0.92–0.94 for FAQ-style bots
     topK: 5,                                  // pull top-5 then re-rank by recency
     onlyOnMiss: true,                         // skip semantic on exact hits (default)
     extractText: (req) =>                     // optional: customize what gets embedded
@@ -773,13 +1036,47 @@ export function withSemantic(options: SemanticOptions): SemanticLayer;
 export interface SemanticOptions {
   /** Required: how to compute embeddings. */
   readonly embeddings: EmbeddingProvider;
-  /** Cosine similarity threshold in `[0, 1]`. Default `0.94`. */
+  /**
+   * Cosine similarity threshold in `[0, 1]`. Default `0.95`.
+   *
+   * The default is intentionally above the historical "sweet spot" of
+   * 0.92–0.94: a confidently-wrong cached answer to a slightly-different
+   * question is the worst possible UX failure here — much worse than a
+   * cache miss. 0.92–0.94 is opt-in for FAQ-style bots where a small
+   * false-positive rate is acceptable; values below 0.92 are documented
+   * as a foot-gun.
+   */
   readonly threshold?: number;
   /** Top-K candidates fetched from the vector index. Default `5`. */
   readonly topK?: number;
   /** If true (default), skip semantic lookup when an exact match already hits. */
   readonly onlyOnMiss?: boolean;
-  /** Custom function deciding what string to embed. Default joins user-role messages. */
+  /**
+   * Custom function deciding what string to embed. The default joins
+   * `user`-role messages' string content.
+   *
+   * **Multimodal safety.** If a message's content is an array containing
+   * non-text parts (vision images, audio, file refs — common in GPT-4o
+   * Vision and Claude with images), the default `extractText` THROWS
+   * `EmbeddingError(EMBEDDING_REQUEST_FAILED)` rather than silently
+   * embedding only the caller's text caption. Silent text-only fallback
+   * would conflate visually-different requests under a single cache key
+   * and serve confidently-wrong answers across them. Callers that DO
+   * want vision-aware semantic caching must supply an explicit
+   * `extractText` that incorporates a hash of each non-text part:
+   *
+   * @example
+   * extractText: (req) => {
+   *   const parts: string[] = [];
+   *   for (const m of req.messages ?? []) {
+   *     for (const p of asArray(m.content)) {
+   *       if (p.type === 'text') parts.push(p.text);
+   *       else if (p.type === 'image') parts.push(`<image:${sha256(p.url)}>`);
+   *     }
+   *   }
+   *   return parts.join('\n');
+   * }
+   */
   readonly extractText?: (request: CacheRequest) => string;
   /** Vector namespace passed to storage adapters that support it. Default: cache namespace. */
   readonly vectorNamespace?: string;
@@ -1025,31 +1322,59 @@ const reply = await openai.chat.completions.create({
 
 ```ts
 /**
- * Wrap an OpenAI client with caching. Returns a `Proxy` with the same shape
- * as the input client, so existing code keeps working — replace the
- * constructor and you're done.
+ * Wrap an OpenAI client with caching. Returns a `Proxy` with the **exact
+ * same type** as the input client, so existing code keeps working — replace
+ * the constructor and you're done. The Proxy preserves the SDK's
+ * parameter and return types verbatim (no `any` widening, no re-typed
+ * shapes), so `client.chat.completions.create({...})` still autocompletes
+ * its params and returns `ChatCompletion`, not `unknown`.
  *
  * Intercepted methods:
  *   - `chat.completions.create({ stream: false })` → exact-match cache.
  *   - `chat.completions.create({ stream: true })`  → streaming cache via `wrapStream`.
- *   - `embeddings.create()`                        → exact-match cache.
- *   - `responses.create({ stream?: })`             → both cache modes.
+ *   - `embeddings.create()`                        → exact-match cache (uses `CacheRequest.input`).
+ *   - `responses.create({ stream?: })`             → both cache modes (uses `CacheRequest.input`).
  *
  * Unintercepted methods pass through unchanged.
  */
 export function wrapOpenAI<TClient extends OpenAILike>(
   client: TClient,
-  options: WrapClientOptions,
+  options: WrapClientOptions<TClient>,
 ): TClient;
 
-export interface WrapClientOptions {
+/**
+ * Structural subtype that captures the surface we proxy. The `(...args: any[]) => any`
+ * shape is intentional — it lets the user's installed `openai` package's
+ * concrete types flow through via structural subtyping without us
+ * re-typing any return shape (which would leak `any` into the user's
+ * call sites). The Proxy returns `ReturnType<TClient['chat']['completions']['create']>`
+ * verbatim.
+ */
+export type OpenAILike = {
+  chat: { completions: { create: (...args: any[]) => any } };
+  embeddings?: { create: (...args: any[]) => any };
+  responses?: { create: (...args: any[]) => any };
+};
+
+/**
+ * Generic in `TClient` so that `skip` / `ttl` callbacks see the precise
+ * request shape the user's SDK accepts (`ChatCompletionCreateParams` etc.),
+ * not a `Record<string, unknown>` widening that loses autocomplete.
+ */
+export interface WrapClientOptions<TClient extends OpenAILike = OpenAILike> {
   readonly cache: LLMCache;
   /** Sub-namespace mixed into the cache key (in addition to the cache's global namespace). */
   readonly namespace?: string;
-  /** Skip caching for requests where this returns true (e.g. `(req) => req.tools != null`). */
-  readonly skip?: (request: Readonly<Record<string, unknown>>) => boolean;
+  /**
+   * Skip caching for requests where this returns true. Typed against the
+   * client's actual request shape so `req.tools` autocompletes:
+   *
+   * @example
+   * skip: (req) => req.tools != null
+   */
+  readonly skip?: <TReq extends Parameters<TClient['chat']['completions']['create']>[0]>(request: TReq) => boolean;
   /** TTL override per request. */
-  readonly ttl?: number | ((request: Readonly<Record<string, unknown>>) => number);
+  readonly ttl?: number | (<TReq extends Parameters<TClient['chat']['completions']['create']>[0]>(request: TReq) => number);
 }
 ```
 
@@ -1125,11 +1450,11 @@ export class LangChainCache extends BaseCache {
 
 ```ts
 import { Hono } from 'hono';
-import { cacheHandler } from '@aikit/cache/adapters/hono';
+import { cacheMiddleware } from '@aikit/cache/adapters/hono';
 
 const app = new Hono();
 app.post('/v1/chat/completions',
-  cacheHandler({ cache, ttl: 3_600_000 }),
+  cacheMiddleware({ cache, ttl: 3_600_000 }),
   async (c) => {
     const body = await c.req.json();
     const reply = await openai.chat.completions.create(body);
@@ -1140,7 +1465,7 @@ app.post('/v1/chat/completions',
 
 ```ts
 // @aikit/cache/adapters/hono
-export function cacheHandler<E extends HonoEnv = HonoEnv>(options: {
+export function cacheMiddleware<E extends HonoEnv = HonoEnv>(options: {
   readonly cache: LLMCache;
   readonly ttl?: number;
   readonly extractRequest?: (c: Context<E>) => CacheRequest | undefined;
@@ -1353,13 +1678,14 @@ A test in `tests/internal/dependency-graph.test.ts` will programmatically scan `
 
 ```ts
 // src/core/cache.ts
-export interface LLMCache {
+export interface Cache {
   wrap<T>(
     request: CacheRequest,
     fn: () => Promise<T>,
     options?: WrapOptions,
   ): Promise<T>;
 }
+export type LLMCache = Cache;
 
 // Usage:
 const reply = await cache.wrap(req, () => openai.chat.completions.create({ ... }));
@@ -1402,13 +1728,21 @@ Storage adapters cannot know the runtime shape of `T` (they store raw bytes) but
 
 ```ts
 type OpenAILike = {
-  chat: { completions: { create: (...args: any[]) => Promise<any> } };
-  embeddings?: { create: (...args: any[]) => Promise<any> };
-  responses?: { create: (...args: any[]) => Promise<any> };
+  chat: { completions: { create: (...args: any[]) => any } };
+  embeddings?: { create: (...args: any[]) => any };
+  responses?: { create: (...args: any[]) => any };
 };
 ```
 
-We intentionally use `any` here for SDK call signatures because OpenAI's types are vast and provider versions differ; the user's installed `openai` package supplies the precise types via TypeScript's structural subtyping.
+The `any` here is **only the structural-subtyping bound** — it's wide enough to admit any concrete `openai` SDK shape the user installs without forcing us to re-declare every overload. Because the Proxy is generic in `TClient` and returns `TClient` (not a re-typed shape), and because intercepted methods forward to the SDK's own implementation, the user's call site keeps the SDK's exact return type:
+
+```ts
+const openai = wrapOpenAI(new OpenAI(), { cache });
+const r = await openai.chat.completions.create({ model: 'gpt-4o', messages: [...] });
+//    ^? ChatCompletion (from the openai package), NOT any
+```
+
+A type test in `tests/types/adapter-result.test-d.ts` asserts this with `expectTypeOf`, so if a future refactor accidentally re-types a return through the Proxy, CI fails. The `WrapClientOptions<TClient>.skip` / `.ttl` callbacks are also generic in `TClient`, so `skip: (req) => req.tools != null` autocompletes against the SDK's `ChatCompletionCreateParams` instead of `Record<string, unknown>`.
 
 ### 4.4 Strict mode at the type level
 
@@ -1464,7 +1798,9 @@ export type ErrorCode =
   | 'STREAM_CAPTURE_FAILED'
   | 'STREAM_REPLAY_FAILED'
   | 'STREAM_SERIALIZER_MISSING'
+  | 'STREAM_SERIALIZER_MISMATCH'
   | 'STREAM_UPSTREAM_ABORTED'
+  | 'STREAM_API_UNAVAILABLE'
   | 'INVALIDATION_PATTERN_INVALID'
   | 'INVALIDATION_NOT_SUPPORTED'
   | 'COST_UNKNOWN_MODEL'
@@ -1585,6 +1921,7 @@ The event listener receives a typed `{ error: CacheError; operation: string }` p
 | `./storage/cloudflare-kv` | CF Workers KV adapter | 0.6 KB |
 | `./storage/vercel-kv` | Vercel KV adapter | 0.6 KB |
 | `./storage/sqlite` | better-sqlite3 adapter (Node-only) | 1.1 KB |
+| `./storage/postgres` | pg / postgres + pgvector adapter (Node-only) | 1.4 KB |
 | `./embeddings` | `customEmbeddings`, `withBatching`, types | 0.8 KB |
 | `./embeddings/openai` | OpenAI embeddings (REST) | 0.9 KB |
 | `./embeddings/cohere` | Cohere embeddings (REST) | 0.7 KB |
@@ -1632,6 +1969,7 @@ export default defineConfig({
     'storage/cloudflare-kv':            'src/storage/cloudflare-kv.ts',
     'storage/vercel-kv':                'src/storage/vercel-kv.ts',
     'storage/sqlite':                   'src/storage/sqlite.ts',
+    'storage/postgres':                 'src/storage/postgres.ts',
     'embeddings/index':                 'src/embeddings/index.ts',
     'embeddings/openai':                'src/embeddings/openai.ts',
     'embeddings/cohere':                'src/embeddings/cohere.ts',
@@ -1655,6 +1993,7 @@ export default defineConfig({
   external: [
     'openai', '@anthropic-ai/sdk', 'ai', '@langchain/core',
     'ioredis', '@upstash/redis', 'better-sqlite3', '@vercel/kv',
+    'pg', 'postgres',
     'cohere-ai',
     'hono', 'express', 'next',
     'node:fs/promises', 'node:fs',
@@ -1695,18 +2034,19 @@ The bundle-size discipline is the headline differentiator vs. LangChain's `@lang
 
 | Package | Why peer | Required by |
 |---|---|---|
-| `openai` | OpenAI client surface (Proxy target) and stream chunk types | `./adapters/openai`, `./embeddings/openai` (types only — no runtime import for embeddings; we hit the REST endpoint directly) |
-| `@anthropic-ai/sdk` | Anthropic client surface and message types | `./adapters/anthropic` |
-| `ai` | Vercel AI SDK middleware shape (`LanguageModelV3Middleware`) | `./adapters/ai-sdk` |
-| `@langchain/core` | `BaseCache`, `Generation` | `./adapters/langchain` |
-| `ioredis` | Redis client | `./storage/redis` |
-| `@upstash/redis` | Upstash REST client | `./storage/upstash` (only when used via the `{ client }` constructor; the `{ url, token }` form uses bare `fetch`) |
-| `@vercel/kv` | Vercel KV client | `./storage/vercel-kv` |
-| `better-sqlite3` | SQLite driver | `./storage/sqlite` (Node-only, lazy `import()`) |
-| `cohere-ai` | Cohere client surface | `./embeddings/cohere` (types only — REST direct) |
-| `hono` | Hono context types | `./adapters/hono` |
-| `express` | Express middleware types | `./adapters/express` |
-| `next` | Next.js Route Handler types | `./adapters/next` |
+| `openai` | OpenAI client surface (Proxy target) and stream chunk types | **Runtime peer:** `./adapters/openai` (we Proxy a real `OpenAI` instance). **Types-only peer:** `./embeddings/openai` (we hit the REST endpoint directly via `fetch` — `import type` only, the SDK is never required at runtime). |
+| `@anthropic-ai/sdk` | Anthropic client surface and message types | **Runtime peer:** `./adapters/anthropic`. |
+| `ai` | Vercel AI SDK middleware shape (`LanguageModelV3Middleware`) | **Runtime peer:** `./adapters/ai-sdk`. |
+| `@langchain/core` | `BaseCache`, `Generation` | **Runtime peer:** `./adapters/langchain` (we extend `BaseCache`). |
+| `ioredis` | Redis client | **Runtime peer:** `./storage/redis` (only when constructing the client; `redisStorage({ client })` accepts a pre-constructed client and never imports `ioredis` itself). |
+| `@upstash/redis` | Upstash REST client | **Runtime peer:** `./storage/upstash` only when used via the `{ client }` constructor; the `{ url, token }` form uses bare `fetch`. |
+| `@vercel/kv` | Vercel KV client | **Runtime peer:** `./storage/vercel-kv`. |
+| `better-sqlite3` | SQLite driver | **Runtime peer:** `./storage/sqlite` (Node-only, lazy `import()`). |
+| `pg` or `postgres` | Postgres driver (either accepted) | **Runtime peer:** `./storage/postgres` (Node-only, lazy `import()`). The pgvector extension is a server-side feature, not an npm dep. |
+| `cohere-ai` | Cohere client surface | **Types-only peer:** `./embeddings/cohere` (REST direct via `fetch`; `import type` only). The peer-dep entry exists purely so users on TS-strict resolution get IntelliSense. |
+| `hono` | Hono context types | **Runtime peer:** `./adapters/hono`. |
+| `express` | Express middleware types | **Runtime peer:** `./adapters/express`. |
+| `next` | Next.js Route Handler types | **Runtime peer:** `./adapters/next`. |
 
 All are marked `peerDependenciesMeta.<pkg>.optional = true` so installing the lib without them is silent. Adapters that only use provider types via `import type` work even at runtime without the SDK installed — they are pure data-shape mappers.
 
@@ -1799,7 +2139,8 @@ Standard set for the portfolio: `tsup`, `typescript`, `vitest`, `@vitest/coverag
 1. Two requests with the same fields in different key order — same key.
 2. A request with `params: undefined` vs missing `params` field — same key.
 3. A request with `params: { temperature: 0 }` vs `params: { temperature: 0, top_p: 1 }` — **different** keys (top_p affects output).
-4. A request with metadata containing a UUID (`request_id`) — ignored by default via `WrapOptions.ignoreFields`; same key.
+4. A request with `metadata` containing a UUID (`request_id`), trace span, or any caller-side annotation — the entire `metadata` subtree is in the default `WrapOptions.ignoreFields`, so adding/removing metadata fields never changes the key.
+4a. A request with both `messages` and `input` set, or with neither set — `CACHE_INVALID_OPTIONS` thrown synchronously at `wrap()` entry. Adapters that intercept embedding / responses / audio endpoints must populate `input`, never smuggle data through `params`.
 5. Messages containing user-supplied JSON-encoded strings — hashed verbatim; we do not double-decode.
 6. `messages` containing whitespace-only differences (`'Hello'` vs `'Hello '`) — different keys by default; opt-in `canonicalize: { trimWhitespace: true }` to collapse.
 7. Unicode normalization — input is treated as code-point sequences. NFC/NFD differences produce different keys; documented.
@@ -1836,7 +2177,7 @@ Standard set for the portfolio: `tsup`, `typescript`, `vitest`, `@vitest/coverag
 29. Upstream emits 0 chunks before close — cached as an empty array; replays as an immediately-closed stream.
 30. Upstream emits non-serializable values (functions, symbols) — `serializer.serialize` throws `STREAM_CAPTURE_FAILED`; the consumer still gets the live stream; nothing is cached.
 31. Replay with `chunkDelayMs: 'preserve'` after a process restart — original timing was captured per-chunk in the serialized envelope; preserved across restarts.
-32. Replay of a stream cached under one serializer with a different serializer — `STREAM_REPLAY_FAILED` (deserialization mismatch). Documented: pin one serializer per cache key namespace.
+32. Replay of a stream cached under one serializer with a different serializer — detected by `meta.serializerId` mismatch on the loaded envelope; the cache fails fast with `STREAM_REPLAY_FAILED` and treats it as a miss (next call fetches and re-caches under the current serializer's id). The check is purely on the stamped id, so two serializers producing the same wire shape no longer silently corrupt each other's data.
 33. Stream payload exceeds storage's `maxValueBytes` — emit `'evict'` style warning, do not cache, but the consumer's stream completes normally.
 
 ### 9.5 Storage adapters
@@ -1862,7 +2203,7 @@ Standard set for the portfolio: `tsup`, `typescript`, `vitest`, `@vitest/coverag
 49. Storage advertises `vectorSearch` capability but the underlying adapter throws `STORAGE_VECTOR_UNSUPPORTED` at runtime — semantic layer falls back to `MemoryVectorIndex` and emits a one-time warning.
 50. Semantic layer with a storage that does not advertise vector search — automatically uses `MemoryVectorIndex`. Documented as not appropriate for > 10k entries.
 51. `extractText` returns an empty string — `EmbeddingError(EMBEDDING_REQUEST_FAILED)` with hint to override `extractText`.
-52. Caller writes a non-text message (e.g. multimodal image part) — default `extractText` joins only string content; documented.
+52. Caller writes a non-text message (multimodal image / audio / file part) — default `extractText` THROWS `EmbeddingError(EMBEDDING_REQUEST_FAILED)` with a hint to override `extractText` and incorporate hashes of the non-text parts. Silent text-only fallback would conflate visually-different vision requests under one cache key and serve confidently-wrong cross-image hits.
 53. Embedding cost tracking — every embedding call records its own cost into `stats.embeddingCostUSD`; the `stats.netSavedUSD` field surfaces the net effect after embedding overhead.
 
 ### 9.7 Cost
@@ -1886,7 +2227,7 @@ Standard set for the portfolio: `tsup`, `typescript`, `vitest`, `@vitest/coverag
 ### 9.9 Edge runtime / Web Crypto
 
 66. `globalThis.crypto?.subtle` undefined — `WEB_CRYPTO_UNAVAILABLE`. Theoretical; supported runtimes always provide it. Kept as a defensive guard.
-67. `ReadableStream.tee()` not available — `WEB_CRYPTO_UNAVAILABLE` family error (currently no separate code; v0.2 adds `STREAM_API_UNAVAILABLE` if any reasonable runtime is missing it).
+67. `ReadableStream.tee()` not available — `STREAM_API_UNAVAILABLE` thrown at first `wrapStream()` call. Theoretical on supported runtimes (all expose Web Streams); kept as a defensive guard so the user gets a precise diagnostic instead of an unrelated `TypeError`.
 68. `process.env.NODE_ENV` access in error message construction — gated by `typeof process !== 'undefined'` (Cloudflare Workers throws a `ReferenceError` on undefined `process`).
 69. Cache used inside a Cloudflare Worker request handler — writes wrapped in `ctx.waitUntil(...)` are completed even if the handler returns early.
 
@@ -1940,7 +2281,7 @@ Pinned here so future contributors don't drift the scope:
 6. `core/invalidate` + per-storage invalidate strategy (memory first).
 7. `core/stream` + `wrapStream` + `aiSdkStreamSerializer` (smallest serializer first).
 8. `cost/pricing` (Apr 2026 snapshot) + `cost/pricing-registry` + `cost/tracker` — savings math.
-9. `storage/multi-tier` + `storage/upstash` + `storage/cloudflare-kv` + `storage/redis` + `storage/sqlite` + `storage/vercel-kv`.
+9. `storage/multi-tier` + `storage/upstash` + `storage/cloudflare-kv` + `storage/redis` + `storage/sqlite` + `storage/vercel-kv` + `storage/postgres` (incl. pgvector). Each Redis-/Upstash-shipped adapter also exports its `DistributedLock` (`redisLock`, `upstashLock`) for multi-pod single-flight.
 10. `embeddings/types` + `embeddings/custom` + `embeddings/openai` + `embeddings/cohere` + `embeddings/voyage` + `embeddings/batched`.
 11. `semantic/similarity` + `semantic/memory-index` + `semantic/store-adapter` + `semantic/layer`.
 12. `adapters/openai` + `adapters/anthropic` + `adapters/ai-sdk` + `adapters/langchain` + `adapters/hono` + `adapters/express` + `adapters/next`.
@@ -1949,7 +2290,7 @@ Pinned here so future contributors don't drift the scope:
 
 ### v0.2 milestones (post-launch backlog)
 
-- **Distributed coalescing** — share single-flight across processes via a Redis lock so a 50-pod deployment doesn't fan out into 50 simultaneous LLM calls. Currently coalescing is per-instance.
+- **Reference `DistributedLock` polish** — the `coalesce.lock` interface ships in v0.1 (with `redisLock` from `./storage/redis` and `upstashLock` from `./storage/upstash`), so multi-pod deployments can share single-flight on day one. v0.2 adds: a Cloudflare Durable Objects lock implementation, fairness/queue-length metrics on the lock interface, and a built-in benchmark suite.
 - **`multiTierStorage({ readPolicy: 'newest' })`** — compare timestamps across tiers and return the freshest (currently L1 always wins).
 - **Negative-result caching** — cache `fn()` errors with a short TTL to absorb transient outages without hammering the upstream. Opt-in due to the obvious foot-gun.
 - **`v: 2` envelope** — add `model`, `provider`, and `region` to every entry for richer observability without re-canonicalizing the key.
@@ -1958,3 +2299,87 @@ Pinned here so future contributors don't drift the scope:
 - **OpenTelemetry exporter** — wraps `cache.on('hit'/'miss'/'error')` into spans / counters so the cache slots into existing observability.
 - **`semantic/index/hnsw`** — opt-in HNSW small-world index for in-memory deployments above 10k vectors. Currently linear-scan only.
 - **`storage/durable-object`** — Cloudflare Durable Objects adapter for stronger per-key consistency than KV.
+
+---
+
+## Review Changes
+
+This section records the disposition of every concern raised by Mykhailo Kryvytskyi in the architecture-plan PR review. For each item: the original concern, what we changed (or why we did not), and which sections of `PLAN.md` were modified. The reviewer's `REQUEST_CHANGES` verdict is addressed.
+
+### High-severity
+
+1. **`CacheRequest` too chat-centric — embeddings / `responses.create` / agent tool-calls have no `messages`.**
+   *Agreed.* `messages` is now optional and a sibling `input?: unknown` covers everything non-chat. The canonicalizer hashes whichever is provided; passing both throws `CACHE_INVALID_OPTIONS`. Adapters no longer need to smuggle data through `params`, so `invalidate({ prefix })` keeps working.
+   *Sections modified:* §2.1 (`CacheRequest` interface and JSDoc), §1 file responsibility for `core/canonical.ts`, §9.1 edge cases (added 4a).
+
+2. **Self-contradiction: docstring says `metadata` is excluded but the default ignore-list only drops `metadata.timestamp`.**
+   *Agreed.* Default `WrapOptions.ignoreFields` is now `['id', 'request_id', 'metadata']` (whole subtree). The `CacheRequest.metadata` JSDoc was rewritten to match.
+   *Sections modified:* §1 file responsibility for `core/canonical.ts`, §2.1 (`CacheRequest.metadata` JSDoc).
+
+3. **`tryWrap` documented in §2.7 but missing from the `LLMCache` interface.**
+   *Agreed.* `tryWrap` and `tryWrapStream` are now first-class members of the interface; their type-test counterparts will catch any future drift on day one.
+   *Sections modified:* §2.1 (interface block), §2.7 (already accurate; clarified by interface presence).
+
+4. **`wrapOpenAI` collapses SDK return types to `any`.**
+   *Agreed.* The `OpenAILike` bound stays `(...args: any[]) => any` (necessary for structural subtyping against any `openai` SDK version), but `wrapOpenAI<TClient extends OpenAILike>(client: TClient): TClient` returns `TClient` verbatim — call sites keep the SDK's `ChatCompletion` etc., not `any`. `WrapClientOptions<TClient>.skip` and `.ttl` are now generic in `TClient` so callbacks autocomplete against the SDK's request shape.
+   *Sections modified:* §2.6 (`wrapOpenAI` and `WrapClientOptions`), §4.3 (typing rationale + type-test note).
+
+5. **No `AbortSignal` story for `wrap()` / `wrapStream()`.**
+   *Agreed.* `WrapOptions.signal?: AbortSignal` added with documented semantics for both leader and waiter aborts. Default policy is `'leader-only'` (leader cancellation rejects every waiter, next caller retries fresh); `coalesce.abortPolicy: 'shared'` opts into leader-promotion.
+   *Sections modified:* §2.1 (`WrapOptions`, `CacheOptions.coalesce`).
+
+6. **Distributed coalescing in v0.2 is too late — single-flight on multi-pod deploys is broken without it.**
+   *Agreed.* Promoted to v0.1 as a hook: `coalesce.lock?: DistributedLock` (default in-process no-op). Reference implementations `redisLock(client)` and `upstashLock({ url, token })` ship from the existing `./storage/redis` and `./storage/upstash` subpaths in v0.1 so enterprise deployments get genuine cluster-wide single-flight on day one.
+   *Sections modified:* §2.1 (`coalesce` option, `DistributedLock` interface), §2.2 (lock factories on each storage subpath), §11 v0.1 step 9 + v0.2 backlog rewritten.
+
+7. **Cloudflare Workers writes have no `ctx.waitUntil()` plumbing.**
+   *Agreed.* `cloudflareKVStorage(kv, { ctx?: ExecutionContext })` accepts an `ExecutionContext`; writes are wrapped in `ctx.waitUntil(...)` when present. Additionally, `Cache.flush(): Promise<void>` lets users `await cache.flush()` before returning a `Response` if they prefer not to thread `ctx` through.
+   *Sections modified:* §2.1 (`Cache.flush`), §2.2 (`cloudflareKVStorage` options).
+
+8. **Streaming envelope has no serializer fingerprint — replay can silently feed garbage into a wrong deserializer.**
+   *Agreed.* `ChunkSerializer<T>` now requires `readonly id: string`; the streaming envelope stamps `meta.serializerId`; replay refuses on mismatch with `STREAM_REPLAY_FAILED` (treated as a miss). Added `STREAM_SERIALIZER_MISMATCH` to the `ErrorCode` union for diagnostics.
+   *Sections modified:* §1 file responsibility for `core/envelope.ts`, §2.5 (`ChunkSerializer`), §5.1 (`ErrorCode`), §9.4 case 32.
+
+### Medium-severity
+
+9. **pgvector promised in the report scope, missing from v0.1 file map.**
+   *Agreed.* Added `src/storage/postgres.ts` (Postgres + pgvector adapter, Node-only, lazy import of `pg` or `postgres`). Capability `vectorSearch === true` when `vectorColumn` is set so the semantic layer routes to native ANN. Added to the file tree, file-responsibility table, tests, bundle table, tsup config, externals, peer deps, and `package.json#exports`.
+   *Sections modified:* §1 (file tree, responsibility table, tests), §2.2 (`postgresStorage`), §6.1 (bundle table), §6.3 (tsup), §7.2 (peer deps), `package.json` (description, keywords, exports, peers, devDeps).
+
+10. **Default semantic `threshold: 0.94` is borderline — confidently wrong is the worst UX outcome.**
+    *Agreed.* Default raised to `0.95`. JSDoc documents that 0.92–0.94 is opt-in for FAQ-style bots and < 0.92 is a foot-gun.
+    *Sections modified:* §2.3 (example + `SemanticOptions.threshold` JSDoc).
+
+11. **Multimodal content silently dropped from `extractText` — vision apps would conflate visually-different requests.**
+    *Agreed.* Default `extractText` now THROWS `EmbeddingError(EMBEDDING_REQUEST_FAILED)` when message content arrays contain non-text parts; users wanting vision-aware semantic caching must supply a custom `extractText` that incorporates per-image hashes. Documented with an example.
+    *Sections modified:* §2.3 (`SemanticOptions.extractText` JSDoc with example), §9.6 case 52.
+
+12. **`ErrorCode` reuses `WEB_CRYPTO_UNAVAILABLE` for missing `ReadableStream.tee()`.**
+    *Agreed.* Added `STREAM_API_UNAVAILABLE` to the `ErrorCode` union. §9.9 case 67 rewritten.
+    *Sections modified:* §5.1 (`ErrorCode`), §9.9 case 67.
+
+13. **`cacheHandler` (Hono) vs `cacheMiddleware` (Express, AI SDK) — Hono's official term is also "middleware".**
+    *Agreed.* Renamed Hono's export `cacheHandler` → `cacheMiddleware` everywhere.
+    *Sections modified:* §1 (file tree, responsibility table), §2.6 (Hono example, signature).
+
+14. **Tenancy is namespace-by-convention; easy to misconfigure across tenants.**
+    *Agreed.* Added `CacheOptions.keyPolicy?: (request) => string` for programmatic per-request namespace derivation (e.g. `tenant:${req.metadata.tenantId}`); throws `CONFIG_INVALID_NAMESPACE` if it returns empty so a missing tenant id fails loudly. Documented `namespace` as required-when-shared and added a "Secure-defaults checklist" callout at the top of §2.1.
+    *Sections modified:* §2.1 (top-of-section callout, `CacheOptions.namespace` + new `keyPolicy`).
+
+15. **No encryption-at-rest hook for shared-storage scenarios.**
+    *Agreed.* Added `transformAtRest?: TransformAtRest` option to every shipped storage adapter (Redis, Upstash, Cloudflare KV, Vercel KV, SQLite, Postgres). Defined `TransformAtRest` (a paired `encode`/`decode` over `Uint8Array`) so consumers can plug in AES-GCM-with-KMS without forking. Per-adapter rather than core-wide so backends with native at-rest encryption pay no overhead.
+    *Sections modified:* §2.2 (each storage signature + new "Encryption / transform at rest" subsection).
+
+### Low-severity
+
+16. **`embeddings/openai` listed as peer dep but described as REST-direct — same nit for `cohere-ai`.**
+    *Agreed.* The peer-dep table in §7.2 now explicitly labels each peer as "Runtime peer" or "Types-only peer", and `openai`/`cohere-ai` for embeddings are tagged as types-only with the rationale (we hit REST via `fetch`; the entry exists for IntelliSense only).
+    *Sections modified:* §7.2.
+
+17. **`LLMCache` interface name boxes us in — half the use cases aren't strictly LLM responses.**
+    *Agreed.* Renamed the canonical interface to `Cache`; `LLMCache` is exported as a `type LLMCache = Cache` alias. `createCache(...)` returns `Cache`; both names are in the root barrel for SEO and intent at the call site.
+    *Sections modified:* §1 (root barrel responsibility, `core/cache.ts` responsibility), §2.1 (`Cache` interface JSDoc + `createCache` return type + alias export).
+
+### What we did not change
+
+Nothing — every reviewer concern resulted in a substantive plan change. Mykhailo's verdict moves the v0.1 design from "impressive but with correctness/DX gaps" to "ready to start writing source files in the next phase". The next phase will implement the modules in the order listed in §11 v0.1, starting with `internal/digest` + `internal/canonical-json` + `errors/*`.
